@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2 [2026-09-28]
+
+- Updated to `jose-rs` 0.7.1 and aligned the direct signing backend with
+  its `kryptering` 0.6 dependency.
+- Refreshed compatible dependencies, including `async-trait` 0.1.92,
+  `base64` 0.23.1, `redis` 1.7.1, and `thiserror` 2.0.21, along with
+  compatible transitive dependencies in `Cargo.lock`.
+
 ## 0.8.1 [2026-09-23]
 
 - Require `cryptoki` 0.12.1 or newer in the 0.12 series to fix the
