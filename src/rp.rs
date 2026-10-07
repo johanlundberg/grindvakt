@@ -864,6 +864,55 @@ fn check_token_hash(
     Ok(())
 }
 
+/// Verify a signed (`application/jwt`) UserInfo response and bind it to the
+/// id_token subject (OIDC Core §5.3.2).
+///
+/// The JWS is verified against `jwks` with only `allowed_algorithms` accepted
+/// (`none` and unlisted algorithms are rejected), `iss` must equal `issuer`,
+/// `aud` must contain `client_id`, and `sub` must equal `expected_sub`. Returns
+/// the verified claims as a JSON object. Rejects responses whose media type is
+/// not `application/jwt`; use [`userinfo_json_claims`] for JSON. Encrypted
+/// (JWE) responses are not supported.
+pub fn userinfo_signed_claims(
+    jwks: &JwkSet,
+    resp: &HttpFetchResponse,
+    issuer: &str,
+    client_id: &str,
+    expected_sub: &str,
+    allowed_algorithms: &[JwsAlgorithm],
+) -> Result<serde_json::Value> {
+    if allowed_algorithms.is_empty() {
+        return Err(Error::BadRequest(
+            "at least one allowed userinfo signing algorithm is required".into(),
+        ));
+    }
+    let content_type = resp.content_type.as_deref().or(resp.header("content-type"));
+    let is_jwt = content_type.is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/jwt")
+    });
+    if !is_jwt {
+        return Err(Error::Authn(
+            "signed userinfo must be served as application/jwt".into(),
+        ));
+    }
+    let token = resp.text();
+    let validation = Validation::new()
+        .with_issuer(issuer)
+        .with_audience(client_id)
+        .with_allowed_algorithms(allowed_algorithms.to_vec());
+    let claims = jwt::verify_with_jwks(jwks, token.trim(), &validation)?;
+    if claims.sub.as_deref() != Some(expected_sub) {
+        return Err(Error::Authn(
+            "userinfo sub does not match the validated id_token subject".into(),
+        ));
+    }
+    Ok(serde_json::to_value(&claims)?)
+}
+
 /// How [`fetch_userinfo_response`] sends the UserInfo request (OIDC Core §5.3.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UserinfoMethod {
@@ -878,10 +927,13 @@ pub enum UserinfoMethod {
 ///
 /// Validates the issuer and endpoint exactly as [`fetch_userinfo`] does, sends
 /// the request with `method`, and returns the response unchanged. Use this for
-/// signed `application/jwt` UserInfo: the caller verifies the JWS (and, per
-/// OIDC Core §5.3.2, `iss` and `aud`) and must compare `sub` itself. For JSON
-/// responses use [`userinfo_json_claims`]. Encrypted (JWE) responses are not
-/// supported.
+/// signed `application/jwt` UserInfo, and verify the result with
+/// [`userinfo_signed_claims`]. The response is **not** bound to a subject here:
+/// a caller that reads the body without going through [`userinfo_json_claims`]
+/// or [`userinfo_signed_claims`] performs no `sub` check and, for a JWT, no
+/// signature check. Never parse it with [`jwt::peek_claims_unverified`]. For
+/// JSON responses use [`userinfo_json_claims`]. Encrypted (JWE) responses are
+/// not supported.
 pub async fn fetch_userinfo_response(
     http: &Arc<dyn HttpClient>,
     userinfo_endpoint: &str,
@@ -923,7 +975,7 @@ pub fn userinfo_json_claims(
         let media_type = ct.split(';').next().unwrap_or("").trim();
         if media_type.eq_ignore_ascii_case("application/jwt") {
             return Err(Error::Authn(
-                "userinfo is a signed JWT (application/jwt); use rp::fetch_userinfo_response and verify it yourself".into(),
+                "userinfo is a signed JWT (application/jwt); use rp::fetch_userinfo_response and rp::userinfo_signed_claims".into(),
             ));
         }
     }
@@ -1743,6 +1795,57 @@ mod tests {
         assert!(fetch_userinfo(&http, UI_URL, "at", "s1", UI_ISS)
             .await
             .is_err());
+    }
+
+    fn signed_userinfo(
+        key: &SigningKey,
+        tweak: impl FnOnce(&mut Claims),
+    ) -> (crate::http::HttpFetchResponse, JwkSet) {
+        let (token, jwks) = opts_token(key, tweak);
+        let resp = crate::http::HttpFetchResponse::new(200, token)
+            .with_header("Content-Type", "application/jwt; charset=utf-8");
+        (resp, jwks)
+    }
+
+    #[test]
+    fn userinfo_signed_claims_verifies_and_binds() {
+        let (_c, _p, key) = client_and_provider();
+        let es = [JwsAlgorithm::ES256];
+        let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
+
+        let (resp, jwks) = signed_userinfo(&key, |_| {});
+        let v = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &es).unwrap();
+        assert_eq!(v["sub"], "subject");
+
+        // Wrong subject, issuer and audience are rejected.
+        assert!(userinfo_signed_claims(&jwks, &resp, iss, aud, "other", &es).is_err());
+        assert!(userinfo_signed_claims(&jwks, &resp, "https://evil", aud, "subject", &es).is_err());
+        assert!(userinfo_signed_claims(&jwks, &resp, iss, "other-rp", "subject", &es).is_err());
+
+        // A signature from a different key is rejected.
+        let (_, _, other) = client_and_provider();
+        assert!(
+            userinfo_signed_claims(&other.to_public_jwks(), &resp, iss, aud, "subject", &es)
+                .is_err()
+        );
+
+        // Algorithm allow-list is enforced; an empty list is a configuration error.
+        assert!(
+            userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[JwsAlgorithm::RS256])
+                .is_err()
+        );
+        let err = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[]).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+
+        // A JSON-typed response is not accepted as signed userinfo.
+        let json = json_userinfo("application/json");
+        assert!(userinfo_signed_claims(&jwks, &json, iss, aud, "s1", &es).is_err());
+
+        // A tampered token fails verification.
+        let mut bad = resp.clone();
+        let n = bad.body.len();
+        bad.body[n - 3] = if bad.body[n - 3] == b'A' { b'B' } else { b'A' };
+        assert!(userinfo_signed_claims(&jwks, &bad, iss, aud, "subject", &es).is_err());
     }
 
     #[test]
