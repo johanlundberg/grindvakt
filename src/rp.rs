@@ -4,8 +4,8 @@
 //! [`crate::HttpClient`].
 
 use crate::error::{
-    display_safe, escape_upstream_text, is_bidi_format, parse_www_authenticate_bearer, Error,
-    Result, UpstreamHttpError,
+    display_safe, escape_upstream_text, is_bidi_format, parse_www_authenticate_bearer,
+    split_unquoted_commas, Error, Result, UpstreamHttpError,
 };
 use crate::http::{HttpClient, HttpFetchResponse};
 use crate::jwt;
@@ -529,7 +529,7 @@ impl JwksResponse {
     pub fn advertised_ttl_secs(&self) -> Option<u64> {
         let header = self.cache_control.as_deref()?;
         let mut max_age = None;
-        for directive in split_cache_directives(header) {
+        for directive in split_unquoted_commas(header) {
             let directive = directive.trim();
             let (name, value) = match directive.split_once('=') {
                 Some((n, v)) => (n.trim(), Some(v.trim())),
@@ -547,28 +547,6 @@ impl JwksResponse {
         }
         max_age
     }
-}
-
-/// Split a `Cache-Control` value into directives at commas that are outside
-/// quoted strings, honouring backslash escapes inside quotes (RFC 9110 §5.6.4),
-/// so a quoted extension value cannot smuggle in a directive.
-fn split_cache_directives(header: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
-    for (i, c) in header.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if in_quotes && c == '\\' {
-            escaped = true;
-        } else if c == '"' {
-            in_quotes = !in_quotes;
-        } else if c == ',' && !in_quotes {
-            out.push(&header[start..i]);
-            start = i + 1;
-        }
-    }
-    out.push(&header[start..]);
-    out
 }
 
 /// Like [`fetch_jwks`] but also returns `Cache-Control` and `ETag` so callers
@@ -1351,10 +1329,8 @@ pub(crate) fn upstream_error(
         }
     }
     if error.is_none() {
-        if let Some((e, d)) = resp
-            .header("www-authenticate")
-            .and_then(parse_www_authenticate_bearer)
-        {
+        let challenges = resp.header_values("www-authenticate").join(", ");
+        if let Some((e, d)) = parse_www_authenticate_bearer(&challenges) {
             error = e.map(|e| escape_upstream_text(&e, 64));
             description = d.map(|d| escape_upstream_text(&d, 256));
         }
@@ -2137,6 +2113,30 @@ mod tests {
         let shown = err.to_string();
         assert!(!shown.contains('\u{202E}'));
         assert_eq!(shown, "authentication error: token endpoint returned 400");
+    }
+
+    #[tokio::test]
+    async fn userinfo_error_reads_bearer_among_multiple_challenges_and_lines() {
+        // Two header lines: a Basic challenge first, the Bearer error second.
+        let resp = crate::http::HttpFetchResponse::new(401, "")
+            .with_header("WWW-Authenticate", r#"Basic realm="x, y""#)
+            .with_header(
+                "WWW-Authenticate",
+                r#"Bearer error="invalid_token", error_description="expired""#,
+            );
+        let http = mock_post(resp);
+        let err = fetch_userinfo(
+            &http,
+            "https://op.example.org/userinfo",
+            "tok",
+            "sub",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        let up = err.upstream_http().unwrap();
+        assert_eq!(up.error.as_deref(), Some("invalid_token"));
+        assert_eq!(up.error_description.as_deref(), Some("expired"));
     }
 
     #[tokio::test]

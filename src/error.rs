@@ -177,76 +177,132 @@ pub(crate) fn escape_upstream_text(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Split `value` at commas that are outside quoted strings, honouring
+/// backslash escapes inside quotes (RFC 9110 §5.6.4), so quoted text cannot
+/// introduce list elements.
+pub(crate) fn split_unquoted_commas(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if in_quotes && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c == ',' && !in_quotes {
+            out.push(&value[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
+/// One `name=value` auth-param (RFC 9110 §11.2). `None` if malformed, for
+/// example an unterminated or trailing-garbage quoted string.
+fn parse_auth_param(item: &str) -> Option<(String, String)> {
+    let item = item.trim();
+    let name_end = item.find(|c: char| c == '=' || c.is_ascii_whitespace())?;
+    let name = &item[..name_end];
+    let rest = item[name_end..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    if name.is_empty() {
+        return None;
+    }
+    let value = if let Some(quoted) = rest.strip_prefix('"') {
+        let mut val = String::new();
+        let mut chars = quoted.chars();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => val.push(chars.next()?),
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                _ => val.push(c),
+            }
+        }
+        if !closed || !chars.as_str().trim().is_empty() {
+            return None;
+        }
+        val
+    } else {
+        let token = rest.split_ascii_whitespace().next()?;
+        token.to_string()
+    };
+    Some((name.to_string(), value))
+}
+
 /// Parse `error` and `error_description` out of a `WWW-Authenticate` header
-/// value using the `Bearer` (or `DPoP`) scheme. Lenient; `None` on failure.
+/// value (a comma-separated list of challenges, RFC 9110 §11.6.1) by selecting
+/// the first well-formed `Bearer` or `DPoP` challenge that carries them, so
+/// other challenges (`Basic realm="x", Bearer error="invalid_token"`) in either
+/// order do not hide the OAuth error. Lenient; `None` when no such challenge
+/// exists or the Bearer/DPoP challenge is malformed.
 pub(crate) fn parse_www_authenticate_bearer(
     value: &str,
 ) -> Option<(Option<String>, Option<String>)> {
-    let value = value.trim_start();
-    let (scheme, rest) = value.split_once(|c: char| c.is_ascii_whitespace())?;
-    if !scheme.eq_ignore_ascii_case("bearer") && !scheme.eq_ignore_ascii_case("dpop") {
-        return None;
+    struct Challenge {
+        scheme: String,
+        params: Vec<(String, String)>,
+        malformed: bool,
     }
-    let mut chars = rest.chars().peekable();
-    let mut error = None;
-    let mut description = None;
-    loop {
-        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace() || *c == ',') {
-            chars.next();
+    let mut challenges: Vec<Challenge> = Vec::new();
+    for item in split_unquoted_commas(value) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
         }
-        if chars.peek().is_none() {
-            break;
-        }
-        let mut name = String::new();
-        while let Some(&c) = chars.peek() {
-            if c == '=' || c == ',' || c.is_ascii_whitespace() {
-                break;
-            }
-            name.push(c);
-            chars.next();
-        }
-        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
-            chars.next();
-        }
-        if chars.next() != Some('=') {
-            return None;
-        }
-        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
-            chars.next();
-        }
-        let mut val = String::new();
-        if chars.peek() == Some(&'"') {
-            chars.next();
-            let mut closed = false;
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => val.push(chars.next()?),
-                    '"' => {
-                        closed = true;
-                        break;
-                    }
-                    _ => val.push(c),
+        let first_end = item
+            .find(|c: char| c == '=' || c.is_ascii_whitespace())
+            .unwrap_or(item.len());
+        let after_first = item[first_end..].trim_start();
+        if after_first.starts_with('=') {
+            // `name=value`: a further parameter of the current challenge.
+            if let Some(current) = challenges.last_mut() {
+                match parse_auth_param(item) {
+                    Some(param) => current.params.push(param),
+                    None => current.malformed = true,
                 }
-            }
-            if !closed {
-                return None;
             }
         } else {
-            while let Some(&c) = chars.peek() {
-                if c == ',' || c.is_ascii_whitespace() {
-                    break;
+            // `scheme` or `scheme param`: a new challenge.
+            let mut challenge = Challenge {
+                scheme: item[..first_end].to_string(),
+                params: Vec::new(),
+                malformed: false,
+            };
+            if after_first.contains('=') {
+                match parse_auth_param(after_first) {
+                    Some(param) => challenge.params.push(param),
+                    None => challenge.malformed = true,
                 }
-                val.push(c);
-                chars.next();
             }
-        }
-        match name.to_ascii_lowercase().as_str() {
-            "error" if error.is_none() => error = Some(val),
-            "error_description" if description.is_none() => description = Some(val),
-            _ => {}
+            challenges.push(challenge);
         }
     }
-    Some((error, description))
+    for challenge in challenges {
+        if challenge.malformed
+            || !(challenge.scheme.eq_ignore_ascii_case("bearer")
+                || challenge.scheme.eq_ignore_ascii_case("dpop"))
+        {
+            continue;
+        }
+        let find = |key: &str| {
+            challenge
+                .params
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.clone())
+        };
+        let (error, description) = (find("error"), find("error_description"));
+        if error.is_some() || description.is_some() {
+            return Some((error, description));
+        }
+    }
+    None
 }
 
 impl Error {
@@ -351,5 +407,42 @@ mod tests {
         assert!(parse_www_authenticate_bearer("Bearer error=\"unterminated").is_none());
         assert!(parse_www_authenticate_bearer("Bearer garbage").is_none());
         assert!(parse_www_authenticate_bearer("Bearer error=\"a\\").is_none());
+    }
+
+    #[test]
+    fn parse_bearer_among_multiple_challenges() {
+        let want = |p: Option<(Option<String>, Option<String>)>| {
+            let p = p.expect("bearer challenge found");
+            assert_eq!(p.0.as_deref(), Some("invalid_token"));
+            assert_eq!(p.1.as_deref(), Some("expired, really"));
+        };
+        // Bearer after another challenge, and before it.
+        want(parse_www_authenticate_bearer(
+            r#"Basic realm="x", Bearer error="invalid_token", error_description="expired, really""#,
+        ));
+        want(parse_www_authenticate_bearer(
+            r#"Bearer error="invalid_token", error_description="expired, really", Basic realm="x""#,
+        ));
+        // Quoted commas and a quoted "Bearer ..." inside another challenge's value.
+        want(parse_www_authenticate_bearer(
+            r#"Basic realm="a, Bearer error=nope", Bearer error=invalid_token, error_description="expired, really""#,
+        ));
+        // DPoP among others, scheme case-insensitive, extra whitespace.
+        let p = parse_www_authenticate_bearer(
+            r#"Basic realm="x" ,  dpop algs="ES256", error="use_dpop_nonce""#,
+        )
+        .unwrap();
+        assert_eq!(p.0.as_deref(), Some("use_dpop_nonce"));
+        // Parameters of a non-Bearer challenge are never attributed to Bearer.
+        assert!(
+            parse_www_authenticate_bearer(r#"Basic error="not-oauth", Bearer realm="x""#).is_none()
+        );
+        // A malformed Bearer challenge yields nothing.
+        assert!(
+            parse_www_authenticate_bearer(r#"Basic realm="x", Bearer error="unterminated"#)
+                .is_none()
+        );
+        // No Bearer/DPoP challenge at all.
+        assert!(parse_www_authenticate_bearer(r#"Basic realm="x", Negotiate abc=="#).is_none());
     }
 }
