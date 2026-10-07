@@ -7,6 +7,11 @@
   `jwt::oidc_token_hash` (moved from the provider internals), so
   applications can apply the same endpoint and `at_hash`/`c_hash` rules the
   library uses.
+- **Breaking:** `ProviderMetadata::userinfo_endpoint` is now
+  `Option<String>` and is omitted from serialized metadata when `None`.
+  `rp::discover` now accepts providers that do not advertise UserInfo. Use
+  the new `ProviderInfo::require_userinfo_endpoint` / `require_jwks_uri` to
+  get a clear error when an endpoint is missing.
 
 ## 0.8.2 [2026-09-28]
 

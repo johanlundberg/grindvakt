@@ -33,13 +33,29 @@ impl From<ProviderMetadata> for ProviderInfo {
             issuer: m.issuer,
             authorization_endpoint: m.authorization_endpoint,
             token_endpoint: m.token_endpoint,
-            userinfo_endpoint: Some(m.userinfo_endpoint),
+            userinfo_endpoint: m.userinfo_endpoint,
             jwks_uri: Some(m.jwks_uri),
         }
     }
 }
 
 impl ProviderInfo {
+    /// The advertised `userinfo_endpoint`, or `Error::Config` when the
+    /// provider does not advertise one (it is optional in OIDC Discovery).
+    pub fn require_userinfo_endpoint(&self) -> Result<&str> {
+        self.userinfo_endpoint
+            .as_deref()
+            .ok_or_else(|| Error::Config("provider does not advertise a userinfo_endpoint".into()))
+    }
+
+    /// The advertised `jwks_uri`, or `Error::Config` when the provider does
+    /// not advertise one.
+    pub fn require_jwks_uri(&self) -> Result<&str> {
+        self.jwks_uri
+            .as_deref()
+            .ok_or_else(|| Error::Config("provider does not advertise a jwks_uri".into()))
+    }
+
     /// Validate every endpoint before it can receive requests or credentials.
     pub fn validate(&self) -> Result<()> {
         validate_issuer(&self.issuer)?;
@@ -1005,6 +1021,51 @@ mod tests {
             post: None,
         });
         assert!(discover(&http, "http://[2001:db8::1]").await.is_err());
+    }
+
+    fn json_response(body: serde_json::Value) -> crate::http::HttpFetchResponse {
+        crate::http::HttpFetchResponse {
+            status: 200,
+            body: serde_json::to_vec(&body).unwrap(),
+            content_type: Some("application/json".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_accepts_metadata_without_userinfo_endpoint() {
+        let issuer = "https://op.example.com";
+        let mut body = ProviderMetadata::new(issuer, issuer).to_json();
+        body.as_object_mut().unwrap().remove("userinfo_endpoint");
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(json_response(body)),
+            post: None,
+        });
+        let metadata = discover(&http, issuer).await.unwrap();
+        assert!(metadata.userinfo_endpoint.is_none());
+        let info = ProviderInfo::from(metadata);
+        assert!(info.userinfo_endpoint.is_none());
+        let err = info.require_userinfo_endpoint().unwrap_err();
+        assert!(err.to_string().contains("userinfo_endpoint"));
+        assert!(info.require_jwks_uri().is_ok());
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_loopback_http_userinfo_under_remote_issuer() {
+        let issuer = "https://op.example.com";
+        let mut body = ProviderMetadata::new(issuer, issuer).to_json();
+        body["userinfo_endpoint"] = "http://127.0.0.1:8080/userinfo".into();
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(json_response(body)),
+            post: None,
+        });
+        assert!(discover(&http, issuer).await.is_err());
+    }
+
+    #[test]
+    fn require_jwks_uri_errors_when_missing() {
+        let (_, provider, _) = client_and_provider();
+        let err = provider.require_jwks_uri().unwrap_err();
+        assert!(err.to_string().contains("jwks_uri"));
     }
 
     #[tokio::test]
