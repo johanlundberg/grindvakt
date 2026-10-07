@@ -63,8 +63,14 @@ pub enum Error {
 ///
 /// All text fields are sanitized: control and bidirectional-format characters
 /// are escaped (for example `\u{1b}`) and lengths are capped, so the values
-/// are safe to log or display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// cannot inject terminal or log escapes.
+///
+/// Sanitizing does not make [`UpstreamHttpError::body`] safe to log verbatim:
+/// upstream error bodies can echo submitted values (codes, `state`, PKCE
+/// verifiers) or carry personal data. The `Debug` implementation therefore
+/// redacts the body and prints only its length; do not copy `body` into logs
+/// or into any HTTP, JSON or other serialized error surface.
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UpstreamHttpError {
     /// HTTP status code of the upstream response.
@@ -73,7 +79,8 @@ pub struct UpstreamHttpError {
     pub error: Option<String>,
     /// OAuth `error_description`, from the JSON body or `WWW-Authenticate`.
     pub error_description: Option<String>,
-    /// Response body, escaped and length capped.
+    /// Response body, escaped and length capped. May contain echoed secrets or
+    /// personal data: never log it verbatim or return it to end users.
     pub body: Option<String>,
     message: String,
     auth_failure: bool,
@@ -108,6 +115,23 @@ impl UpstreamHttpError {
     /// The human-readable message (also the `Display` text).
     pub fn message(&self) -> &str {
         &self.message
+    }
+}
+
+impl std::fmt::Debug for UpstreamHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = self
+            .body
+            .as_ref()
+            .map(|b| format!("<redacted, {} chars>", b.chars().count()));
+        f.debug_struct("UpstreamHttpError")
+            .field("status", &self.status)
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .field("body", &body)
+            .field("message", &self.message)
+            .field("auth_failure", &self.auth_failure)
+            .finish()
     }
 }
 
@@ -258,6 +282,27 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upstream_http_error_debug_redacts_body() {
+        let e = super::UpstreamHttpError::new(
+            Some(400),
+            Some("invalid_grant".into()),
+            None,
+            Some("code=SECRET-CODE verifier=SECRET".into()),
+            "authentication error: token endpoint returned 400".into(),
+            true,
+        );
+        let dbg = format!(
+            "{e:?} {:?}",
+            super::Error::UpstreamHttp(Box::new(e.clone()))
+        );
+        assert!(!dbg.contains("SECRET"), "{dbg}");
+        assert!(dbg.contains("redacted"), "{dbg}");
+        assert!(dbg.contains("invalid_grant"));
+        // The body stays available to callers that ask for it.
+        assert!(e.body.as_deref().unwrap().contains("SECRET-CODE"));
+    }
+
     use super::*;
 
     #[test]
