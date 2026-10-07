@@ -18,6 +18,9 @@
   `with_header`, `header` and `cache_control`. `HttpClient` implementations
   should fill in `headers`. Code that builds it with a struct literal must add
   the field or use `..Default::default()`.
+- `HttpClient` gains `get_with_headers`, with a default implementation that
+  returns an error, so existing clients keep compiling. Implement it to
+  enable GET requests to UserInfo.
 
 ## 0.8.2 [2026-09-28]
 

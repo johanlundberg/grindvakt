@@ -141,6 +141,22 @@ pub trait HttpClient: Send + Sync {
         form: &[(String, String)],
         headers: &[(String, String)],
     ) -> crate::error::Result<HttpFetchResponse>;
+
+    /// Issue a GET carrying request headers (e.g. `Authorization: Bearer`).
+    ///
+    /// The default implementation returns an error; override it to enable GET
+    /// UserInfo requests. Implementations must not forward these headers when
+    /// following redirects to another origin.
+    async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> crate::error::Result<HttpFetchResponse> {
+        let _ = (url, headers);
+        Err(crate::error::Error::Config(
+            "this HttpClient does not implement get_with_headers".into(),
+        ))
+    }
 }
 
 /// The result of an outbound fetch.
@@ -208,6 +224,76 @@ impl HttpFetchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct BasicClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for BasicClient {
+        async fn get(&self, _url: &str) -> crate::error::Result<HttpFetchResponse> {
+            Ok(HttpFetchResponse::new(200, "get"))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _headers: &[(String, String)],
+        ) -> crate::error::Result<HttpFetchResponse> {
+            Ok(HttpFetchResponse::new(200, "post"))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingClient {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for RecordingClient {
+        async fn get(&self, _url: &str) -> crate::error::Result<HttpFetchResponse> {
+            Ok(HttpFetchResponse::new(200, "get"))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _headers: &[(String, String)],
+        ) -> crate::error::Result<HttpFetchResponse> {
+            Ok(HttpFetchResponse::new(200, "post"))
+        }
+
+        async fn get_with_headers(
+            &self,
+            _url: &str,
+            headers: &[(String, String)],
+        ) -> crate::error::Result<HttpFetchResponse> {
+            *self.seen.lock().unwrap() = headers.to_vec();
+            Ok(HttpFetchResponse::new(200, "headers"))
+        }
+    }
+
+    #[tokio::test]
+    async fn get_with_headers_defaults_to_error() {
+        let err = BasicClient
+            .get_with_headers("https://op.example/userinfo", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("get_with_headers"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn get_with_headers_override_receives_headers() {
+        let c = RecordingClient::default();
+        let h = vec![("Authorization".to_string(), "Bearer t".to_string())];
+        let r = c
+            .get_with_headers("https://op.example/userinfo", &h)
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(*c.seen.lock().unwrap(), h);
+    }
 
     #[test]
     fn header_lookup_is_case_insensitive_and_returns_first() {
