@@ -3,7 +3,7 @@
 ## 0.9.0 [unreleased]
 
 - `rp::validate_issuer`, `rp::validate_service_endpoint_for_issuer` and
-  `rp::validate_redirect_uri` are now public and documented, and so is
+  `rp::validate_redirect_uri_syntax` are now public and documented, and so is
   `jwt::oidc_token_hash` (moved from the provider internals), so
   applications can apply the same endpoint and `at_hash`/`c_hash` rules the
   library uses.

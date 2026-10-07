@@ -117,7 +117,7 @@ pub fn authorization_url(
     extra: &[(&str, &str)],
 ) -> Result<String> {
     provider.validate()?;
-    validate_redirect_uri(&client.redirect_uri)?;
+    validate_redirect_uri_syntax(&client.redirect_uri)?;
     if !client
         .scope
         .split_whitespace()
@@ -228,7 +228,7 @@ pub fn signed_request_object(
     code_challenge: Option<&str>,
 ) -> Result<String> {
     provider.validate()?;
-    validate_redirect_uri(&client.redirect_uri)?;
+    validate_redirect_uri_syntax(&client.redirect_uri)?;
     if !client
         .scope
         .split_whitespace()
@@ -392,6 +392,8 @@ fn issuer_allows_loopback_http(issuer: &str) -> bool {
 /// The endpoint must be an `https` URL; loopback `http` is allowed only when
 /// `issuer` itself is a loopback `http` origin. `name` is used in error
 /// messages. This does not validate `issuer`; call [`validate_issuer`] first.
+/// It does not establish that `issuer` or the endpoint is trusted, only that
+/// the endpoint's scheme is acceptable for that issuer.
 pub fn validate_service_endpoint_for_issuer(
     name: &str,
     endpoint: &str,
@@ -434,7 +436,8 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
 ///
 /// It must be an absolute `https` URL (`http` is accepted only for loopback
 /// hosts) with no whitespace or control characters, userinfo, query or
-/// fragment.
+/// fragment. It checks syntax only: it does not establish that the issuer is
+/// trusted or that discovery metadata matches it.
 pub fn validate_issuer(issuer: &str) -> Result<()> {
     validate_endpoint("issuer", issuer, true)?;
     let parsed = url::Url::parse(issuer).map_err(|e| {
@@ -448,12 +451,17 @@ pub fn validate_issuer(issuer: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a redirect URI.
+/// Check the syntax of a redirect URI.
 ///
 /// This only checks that it parses as an absolute URL and carries no
 /// fragment. The scheme is not checked, so custom/native-app schemes such as
-/// `com.example.app:/cb` are accepted.
-pub fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
+/// `com.example.app:/cb` are accepted, and so are `http://attacker.example`,
+/// `javascript:` and `file:` URIs.
+///
+/// It does **not** make a URI safe to register or redirect to. Do not use it
+/// to vet client-registered redirect URIs on an OP: apply an https or scheme
+/// allow-list and compare redirect URIs by exact match.
+pub fn validate_redirect_uri_syntax(redirect_uri: &str) -> Result<()> {
     let parsed = url::Url::parse(redirect_uri).map_err(|e| {
         Error::BadRequest(format!(
             "invalid redirect_uri {}: {e}",
@@ -499,7 +507,7 @@ pub async fn exchange_code(
     code_verifier: Option<&str>,
 ) -> Result<TokenSet> {
     provider.validate()?;
-    validate_redirect_uri(&client.redirect_uri)?;
+    validate_redirect_uri_syntax(&client.redirect_uri)?;
     if matches!(&client.auth, ClientAuth::None) && code_verifier.is_none() {
         return Err(Error::BadRequest(
             "public clients must supply a PKCE code_verifier".into(),
@@ -2387,8 +2395,16 @@ mod tests {
         assert!(validate_issuer("https://op/#f").is_err());
         assert!(validate_issuer("http://op.example").is_err());
         assert!(validate_issuer("http://localhost:8080").is_ok());
-        assert!(validate_redirect_uri("https://rp.example/cb#frag").is_err());
-        assert!(validate_redirect_uri("com.example.app:/cb").is_ok());
+        assert!(validate_redirect_uri_syntax("https://rp.example/cb#frag").is_err());
+        assert!(validate_redirect_uri_syntax("com.example.app:/cb").is_ok());
+        // Syntax only: these pass and must never be treated as vetted.
+        for uri in [
+            "http://attacker.example/cb",
+            "javascript:alert(1)",
+            "file:///x",
+        ] {
+            assert!(validate_redirect_uri_syntax(uri).is_ok(), "{uri}");
+        }
     }
 
     #[tokio::test]
