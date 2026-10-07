@@ -554,6 +554,10 @@ pub async fn exchange_code(
 }
 
 /// Verify an id_token against the provider JWKS, issuer, audience and nonce.
+///
+/// Uses jose-rs's default 60-second clock-skew leeway. See
+/// [`verify_id_token_with`] to tune the leeway or to enforce `max_age`, `acr`
+/// and `at_hash`.
 pub fn verify_id_token(
     jwks: &JwkSet,
     id_token: &str,
@@ -563,17 +567,105 @@ pub fn verify_id_token(
     allowed_algorithms: &[JwsAlgorithm],
     trusted_additional_audiences: &[&str],
 ) -> Result<Claims> {
+    verify_id_token_with(
+        jwks,
+        id_token,
+        issuer,
+        client_id,
+        expected_nonce,
+        allowed_algorithms,
+        trusted_additional_audiences,
+        &IdTokenOptions::default(),
+    )
+}
+
+/// Mirrors jose-rs `Validation::default()`'s leeway (seconds); used for the
+/// `auth_time` checks when [`IdTokenOptions::leeway`] is `None`.
+const DEFAULT_LEEWAY: u64 = 60;
+
+/// Extra id_token checks for [`verify_id_token_with`].
+///
+/// The struct is `#[non_exhaustive]`: construct it with [`IdTokenOptions::new`]
+/// and the `with_*` builders.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct IdTokenOptions<'a> {
+    /// Clock-skew tolerance (seconds) for exp/nbf/iat and auth_time. None = jose-rs default (60s).
+    pub leeway: Option<u64>,
+    /// OIDC max_age: requires numeric `auth_time` with now <= auth_time + max_age + leeway.
+    pub max_age: Option<u64>,
+    /// If set, `acr` must be present (string) and in this list. Empty list = configuration error (Error::BadRequest).
+    pub acr_values: Option<&'a [&'a str]>,
+    /// If set and the token has `at_hash`, it must equal oidc_token_hash(header alg, access_token).
+    pub access_token: Option<&'a str>,
+}
+
+impl<'a> IdTokenOptions<'a> {
+    /// Options that add no checks beyond [`verify_id_token`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the clock-skew tolerance in seconds.
+    pub fn with_leeway(mut self, seconds: u64) -> Self {
+        self.leeway = Some(seconds);
+        self
+    }
+
+    /// Require `auth_time` to be no older than `seconds` (plus leeway).
+    pub fn with_max_age(mut self, seconds: u64) -> Self {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// Require `acr` to be one of `values`.
+    pub fn with_acr_values(mut self, values: &'a [&'a str]) -> Self {
+        self.acr_values = Some(values);
+        self
+    }
+
+    /// Validate `at_hash` (when present) against this access token.
+    pub fn with_access_token(mut self, access_token: &'a str) -> Self {
+        self.access_token = Some(access_token);
+        self
+    }
+}
+
+/// Like [`verify_id_token`] with additional [`IdTokenOptions`].
+///
+/// The extra checks run after the `sub`, `aud`, `azp` and `nonce` checks.
+/// `max_age` is checked against `auth_time` (not `iat`) and rejects tokens
+/// without a numeric `auth_time`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_id_token_with(
+    jwks: &JwkSet,
+    id_token: &str,
+    issuer: &str,
+    client_id: &str,
+    expected_nonce: Option<&str>,
+    allowed_algorithms: &[JwsAlgorithm],
+    trusted_additional_audiences: &[&str],
+    options: &IdTokenOptions<'_>,
+) -> Result<Claims> {
     if allowed_algorithms.is_empty() {
         return Err(Error::BadRequest(
             "at least one allowed id_token signing algorithm is required".into(),
         ));
     }
-    let validation = Validation::new()
+    if options.acr_values.is_some_and(<[&str]>::is_empty) {
+        return Err(Error::BadRequest(
+            "acr_values must not be empty when set".into(),
+        ));
+    }
+    let mut validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
         .require_exp()
         .require_iat()
         .with_allowed_algorithms(allowed_algorithms.to_vec());
+    if let Some(leeway) = options.leeway {
+        validation = validation.with_leeway(leeway);
+    }
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
 
     if claims.sub.as_deref().is_none_or(str::is_empty) {
@@ -613,6 +705,45 @@ pub fn verify_id_token(
         let got = claims.extra.get("nonce").and_then(|v| v.as_str());
         if got != Some(nonce) {
             return Err(Error::Authn("id_token nonce mismatch".into()));
+        }
+    }
+
+    if let Some(max_age) = options.max_age {
+        let leeway = options.leeway.unwrap_or(DEFAULT_LEEWAY);
+        let auth_time = claims
+            .extra
+            .get("auth_time")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::Authn("id_token missing auth_time required by max_age".into()))?;
+        let now = now_secs();
+        if now > auth_time.saturating_add(max_age).saturating_add(leeway) {
+            return Err(Error::Authn(
+                "id_token auth_time is older than max_age".into(),
+            ));
+        }
+        if auth_time > now.saturating_add(leeway) {
+            return Err(Error::Authn("id_token auth_time is in the future".into()));
+        }
+    }
+
+    if let Some(allowed) = options.acr_values {
+        let acr = claims.extra.get("acr").and_then(|v| v.as_str());
+        if !acr.is_some_and(|acr| allowed.contains(&acr)) {
+            return Err(Error::Authn(
+                "id_token acr missing or not in the accepted list".into(),
+            ));
+        }
+    }
+
+    if let (Some(access_token), Some(at_hash)) = (options.access_token, claims.extra.get("at_hash"))
+    {
+        let at_hash = at_hash
+            .as_str()
+            .ok_or_else(|| Error::Authn("id_token at_hash is not a string".into()))?;
+        let alg = JwsAlgorithm::from_str(&jwt::peek_header(id_token)?.alg)?;
+        let expected = jwt::oidc_token_hash(alg, access_token)?;
+        if !crate::mac::constant_time_eq(expected.as_bytes(), at_hash.as_bytes()) {
+            return Err(Error::Authn("id_token at_hash mismatch".into()));
         }
     }
     Ok(claims)
@@ -1611,6 +1742,231 @@ mod tests {
             .is_err(),
             "a supplied azp must match client_id"
         );
+    }
+
+    fn opts_token(key: &SigningKey, tweak: impl FnOnce(&mut Claims)) -> (String, JwkSet) {
+        let now = now_secs();
+        let mut c = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Single("https://rp.example.com".into())),
+            iat: Some(now),
+            exp: Some(now + 300),
+            ..Default::default()
+        };
+        tweak(&mut c);
+        (jwt::sign(key, &c, None).unwrap(), key.to_public_jwks())
+    }
+
+    fn verify_with(
+        jwks: &JwkSet,
+        token: &str,
+        alg: JwsAlgorithm,
+        options: &IdTokenOptions<'_>,
+    ) -> Result<Claims> {
+        verify_id_token_with(
+            jwks,
+            token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[alg],
+            &[],
+            options,
+        )
+    }
+
+    #[test]
+    fn default_leeway_constant_matches_jose() {
+        assert_eq!(Validation::default().leeway, DEFAULT_LEEWAY);
+    }
+
+    #[test]
+    fn id_token_options_leeway() {
+        let (_c, _p, key) = client_and_provider();
+        let now = now_secs();
+        let (token, jwks) = opts_token(&key, |c| c.exp = Some(now - 30));
+        let es = JwsAlgorithm::ES256;
+        verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[es],
+            &[],
+        )
+        .unwrap();
+        assert!(verify_with(&jwks, &token, es, &IdTokenOptions::new().with_leeway(0)).is_err());
+        verify_with(&jwks, &token, es, &IdTokenOptions::new().with_leeway(60)).unwrap();
+    }
+
+    #[test]
+    fn id_token_options_default_equals_verify_id_token() {
+        let (_c, _p, key) = client_and_provider();
+        let (token, jwks) = opts_token(&key, |_| {});
+        let a = verify_with(
+            &jwks,
+            &token,
+            JwsAlgorithm::ES256,
+            &IdTokenOptions::default(),
+        )
+        .unwrap();
+        let b = verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[JwsAlgorithm::ES256],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.sub, b.sub);
+        assert_eq!(a.exp, b.exp);
+    }
+
+    #[test]
+    fn id_token_options_max_age() {
+        let (_c, _p, key) = client_and_provider();
+        let now = now_secs();
+        let es = JwsAlgorithm::ES256;
+        let opts = IdTokenOptions::new().with_max_age(300);
+
+        let (t, jwks) = opts_token(&key, |_| {});
+        let err = verify_with(&jwks, &t, es, &opts).unwrap_err();
+        assert!(err.to_string().contains("auth_time"), "{err}");
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), (now - 1000).into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), (now - 10).into());
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), (now + 3600).into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), "123".into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), 1.5.into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        // Old iat (still within exp) but recent auth_time: max_age is not iat-based.
+        let (t, jwks) = opts_token(&key, |c| {
+            c.iat = Some(now - 5000);
+            c.exp = Some(now + 300);
+            c.extra.insert("auth_time".into(), (now - 10).into());
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+    }
+
+    #[test]
+    fn id_token_options_acr() {
+        let (_c, _p, key) = client_and_provider();
+        let es = JwsAlgorithm::ES256;
+        let allowed = ["urn:acr:high", "urn:acr:mid"];
+        let opts = IdTokenOptions::new().with_acr_values(&allowed);
+
+        let (t, jwks) = opts_token(&key, |_| {});
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("acr".into(), "urn:acr:low".into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("acr".into(), 2.into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("acr".into(), "urn:acr:mid".into());
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+
+        let empty: [&str; 0] = [];
+        let err = verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new().with_acr_values(&empty),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn id_token_options_at_hash() {
+        let (_c, _p, key) = client_and_provider();
+        let es = JwsAlgorithm::ES256;
+        let at = "access-token-value";
+        let opts = IdTokenOptions::new().with_access_token(at);
+
+        let good = jwt::oidc_token_hash(es, at).unwrap();
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), good.clone().into());
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+        // Present without the option: not checked.
+        verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap();
+        // Different access token: mismatch.
+        assert!(verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new().with_access_token("other")
+        )
+        .is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), "AAAA".into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), 5.into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        // Absent at_hash is accepted even when an access token is supplied.
+        let (t, jwks) = opts_token(&key, |_| {});
+        verify_with(&jwks, &t, es, &opts).unwrap();
+    }
+
+    #[test]
+    fn id_token_options_at_hash_uses_header_alg() {
+        let mut jwk = jose_rs::jwk::generate_ec("P-384").unwrap();
+        jwk.alg = Some("ES384".into());
+        let key = signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES384"), Some("k384"))
+            .unwrap();
+        let at = "access-token-value";
+        let opts = IdTokenOptions::new().with_access_token(at);
+        let es384 = JwsAlgorithm::ES384;
+
+        let good = jwt::oidc_token_hash(es384, at).unwrap();
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), good.clone().into());
+        });
+        verify_with(&jwks, &t, es384, &opts).unwrap();
+
+        let sha256 = jwt::oidc_token_hash(JwsAlgorithm::ES256, at).unwrap();
+        assert_ne!(sha256, good);
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), sha256.clone().into());
+        });
+        assert!(verify_with(&jwks, &t, es384, &opts).is_err());
     }
 
     #[test]

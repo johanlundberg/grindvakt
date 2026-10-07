@@ -15,7 +15,8 @@ runs under actix-web, axum, or anything else.
   DPoP-bound), userinfo. Tokens are stateless (codes/access tokens as JWE,
   id_tokens as signed JWTs), so the token/userinfo endpoints do no server lookups.
 - **RP / client** (`rp`) — discovery, authorization request, code exchange,
-  id_token verification, userinfo (POST or GET, with raw responses for signed
+  id_token verification (`verify_id_token_with` adds leeway, `max_age`, `acr`
+  and `at_hash` checks), userinfo (POST or GET, with raw responses for signed
   UserInfo).
 - **OpenID Federation 1.1** (`federation`).
 - **DPoP** (`dpop`) — RFC 9449 sender-constrained tokens, with a pluggable
