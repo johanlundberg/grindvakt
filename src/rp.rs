@@ -357,8 +357,11 @@ fn issuer_allows_loopback_http(issuer: &str) -> bool {
 }
 
 /// Validate a metadata endpoint relative to its authenticated issuer/entity.
-/// Loopback HTTP is allowed only for an explicitly loopback HTTP issuer.
-pub(crate) fn validate_service_endpoint_for_issuer(
+///
+/// The endpoint must be an `https` URL; loopback `http` is allowed only when
+/// `issuer` itself is a loopback `http` origin. `name` is used in error
+/// messages. This does not validate `issuer`; call [`validate_issuer`] first.
+pub fn validate_service_endpoint_for_issuer(
     name: &str,
     endpoint: &str,
     issuer: &str,
@@ -395,7 +398,12 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_issuer(issuer: &str) -> Result<()> {
+/// Validate an issuer identifier.
+///
+/// It must be an absolute `https` URL (`http` is accepted only for loopback
+/// hosts) with no whitespace or control characters, userinfo, query or
+/// fragment.
+pub fn validate_issuer(issuer: &str) -> Result<()> {
     validate_endpoint("issuer", issuer, true)?;
     let parsed = url::Url::parse(issuer)
         .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
@@ -407,7 +415,12 @@ fn validate_issuer(issuer: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
+/// Validate a redirect URI.
+///
+/// This only checks that it parses as an absolute URL and carries no
+/// fragment. The scheme is not checked, so custom/native-app schemes such as
+/// `com.example.app:/cb` are accepted.
+pub fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
     let parsed = url::Url::parse(redirect_uri)
         .map_err(|e| Error::BadRequest(format!("invalid redirect_uri {redirect_uri}: {e}")))?;
     if parsed.fragment().is_some() {
@@ -1144,5 +1157,15 @@ mod tests {
             .is_err(),
             "a supplied azp must match client_id"
         );
+    }
+
+    #[test]
+    fn public_validators_enforce_documented_rules() {
+        assert!(validate_issuer("https://op/?q").is_err());
+        assert!(validate_issuer("https://op/#f").is_err());
+        assert!(validate_issuer("http://op.example").is_err());
+        assert!(validate_issuer("http://localhost:8080").is_ok());
+        assert!(validate_redirect_uri("https://rp.example/cb#frag").is_err());
+        assert!(validate_redirect_uri("com.example.app:/cb").is_ok());
     }
 }

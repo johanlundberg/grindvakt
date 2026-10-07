@@ -23,7 +23,6 @@ use jose_rs::algorithm::JwsAlgorithm;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
 use serde::Serialize;
-use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -260,7 +259,7 @@ impl Provider {
                 "provider ID-token signing requires an asymmetric key; HS* algorithms require each client's own client_secret".into(),
             ));
         }
-        let supports_token_hash = supports_oidc_token_hash(signing_key.alg());
+        let supports_token_hash = jwt::supports_oidc_token_hash(signing_key.alg());
         metadata.id_token_signing_alg_values_supported = vec![signing_key.alg().to_string()];
         metadata.response_types_supported =
             vec!["code".into(), "id_token".into(), "code token".into()];
@@ -413,7 +412,7 @@ impl Provider {
         req.validate_response_mode()?;
         if req.wants_id_token()
             && (req.wants_code() || req.wants_access_token())
-            && !supports_oidc_token_hash(self.signing_key.alg())
+            && !jwt::supports_oidc_token_hash(self.signing_key.alg())
         {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedResponseType,
@@ -886,7 +885,7 @@ impl Provider {
                     payload.acr.as_deref(),
                     payload.auth_time,
                     None,
-                    supports_oidc_token_hash(self.signing_key.alg())
+                    jwt::supports_oidc_token_hash(self.signing_key.alg())
                         .then_some(access_token.as_str()),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
@@ -1127,7 +1126,7 @@ impl Provider {
                     rt.acr.as_deref(),
                     rt.auth_time,
                     None,
-                    supports_oidc_token_hash(self.signing_key.alg())
+                    jwt::supports_oidc_token_hash(self.signing_key.alg())
                         .then_some(access_token.as_str()),
                 )
                 .map_err(|e| OAuthError::new(OAuthErrorCode::ServerError, e.to_string()))?,
@@ -1502,13 +1501,16 @@ impl Provider {
         if let Some(code) = code {
             c.extra.insert(
                 "c_hash".into(),
-                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), code)?),
+                serde_json::Value::String(jwt::oidc_token_hash(self.signing_key.alg(), code)?),
             );
         }
         if let Some(access_token) = access_token {
             c.extra.insert(
                 "at_hash".into(),
-                serde_json::Value::String(oidc_token_hash(self.signing_key.alg(), access_token)?),
+                serde_json::Value::String(jwt::oidc_token_hash(
+                    self.signing_key.alg(),
+                    access_token,
+                )?),
             );
         }
         for (k, v) in claims {
@@ -1535,52 +1537,6 @@ fn unique_parameters(params: &[(String, String)]) -> Result<BTreeMap<String, Str
         }
     }
     Ok(unique)
-}
-
-fn oidc_token_hash(alg: JwsAlgorithm, value: &str) -> crate::error::Result<String> {
-    let digest = match alg {
-        JwsAlgorithm::RS256
-        | JwsAlgorithm::PS256
-        | JwsAlgorithm::ES256
-        | JwsAlgorithm::ES256K
-        | JwsAlgorithm::HS256 => Sha256::digest(value.as_bytes()).to_vec(),
-        JwsAlgorithm::RS384 | JwsAlgorithm::PS384 | JwsAlgorithm::ES384 | JwsAlgorithm::HS384 => {
-            Sha384::digest(value.as_bytes()).to_vec()
-        }
-        JwsAlgorithm::RS512 | JwsAlgorithm::PS512 | JwsAlgorithm::ES512 | JwsAlgorithm::HS512 => {
-            Sha512::digest(value.as_bytes()).to_vec()
-        }
-        _ => {
-            return Err(crate::error::Error::Crypto(format!(
-                "{} does not define an OIDC token-hash function",
-                alg
-            )))
-        }
-    };
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2]))
-}
-
-/// Whether OIDC Core defines the hash primitive needed for `c_hash` and
-/// `at_hash` from the JWS `alg` name alone. In particular, legacy `EdDSA`
-/// does not identify its curve/hash, so hash-bearing front-channel response
-/// types are not advertised for it.
-fn supports_oidc_token_hash(alg: JwsAlgorithm) -> bool {
-    matches!(
-        alg,
-        JwsAlgorithm::RS256
-            | JwsAlgorithm::PS256
-            | JwsAlgorithm::ES256
-            | JwsAlgorithm::ES256K
-            | JwsAlgorithm::HS256
-            | JwsAlgorithm::RS384
-            | JwsAlgorithm::PS384
-            | JwsAlgorithm::ES384
-            | JwsAlgorithm::HS384
-            | JwsAlgorithm::RS512
-            | JwsAlgorithm::PS512
-            | JwsAlgorithm::ES512
-            | JwsAlgorithm::HS512
-    )
 }
 
 fn token_use_hash(kind: &str, token: &str) -> String {

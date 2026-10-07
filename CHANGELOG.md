@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0 [unreleased]
+
+- `rp::validate_issuer`, `rp::validate_service_endpoint_for_issuer` and
+  `rp::validate_redirect_uri` are now public and documented, and so is
+  `jwt::oidc_token_hash` (moved from the provider internals), so
+  applications can apply the same endpoint and `at_hash`/`c_hash` rules the
+  library uses.
+
 ## 0.8.2 [2026-09-28]
 
 - Updated to `jose-rs` 0.7.1 and aligned the direct signing backend with
