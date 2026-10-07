@@ -133,19 +133,31 @@ impl Response {
 /// # Redirects and credentials
 ///
 /// The library validates request URLs against the issuer policy, but it cannot
-/// validate where a server redirects to. Requests made through `post_form` and
-/// `get_with_headers` can carry credentials (`Authorization: Bearer`, client
-/// secrets in the form body). Implementors **must** either not follow
-/// redirects for these requests or strip `Authorization` (and drop the form
-/// body on a method change) when a redirect crosses origins; otherwise a
-/// redirecting endpoint receives the credential. The library does not and
-/// cannot enforce this.
+/// validate where a server redirects to. Implementors **must** follow these
+/// rules; the library cannot enforce them:
+///
+/// - **`post_form`** carries credentials in the body (`client_secret`,
+///   `client_assertion`, the authorization code and PKCE verifier) and often an
+///   `Authorization` header. Do not follow redirects to a different origin at
+///   all, including method-preserving `307` and `308` redirects, which
+///   resend the body; fail the request instead. Stripping `Authorization` or
+///   dropping the body only on a method change (`301`/`302`/`303`) is **not**
+///   enough. The simplest correct policy is to not follow redirects for
+///   `post_form`.
+/// - **`get_with_headers`** may carry `Authorization: Bearer`. Either do not
+///   follow redirects or strip `Authorization` (and any other credential
+///   header) when a redirect crosses origins.
+///
+/// Otherwise a redirecting endpoint receives the credential.
 #[async_trait::async_trait]
 pub trait HttpClient: Send + Sync {
     /// Issue a GET and return the body bytes (and status).
     async fn get(&self, url: &str) -> crate::error::Result<HttpFetchResponse>;
 
     /// Issue a form-encoded POST.
+    ///
+    /// The form and headers can hold credentials: do not follow cross-origin
+    /// redirects, including `307` and `308` (see the trait documentation).
     async fn post_form(
         &self,
         url: &str,
