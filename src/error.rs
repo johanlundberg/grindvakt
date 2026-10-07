@@ -254,7 +254,6 @@ impl Error {
         }
     }
 
-    /// Suggested HTTP status code for surfacing this error to a client.
     /// Whether this error is an authentication failure: [`Error::Authn`], or an
     /// [`Error::UpstreamHttp`] from a token or UserInfo request (which 0.8
     /// reported as `Authn`). Prefer this to matching variant identity at
@@ -267,6 +266,7 @@ impl Error {
         }
     }
 
+    /// Suggested HTTP status code for surfacing this error to a client.
     pub fn status_hint(&self) -> u16 {
         match self {
             Error::UpstreamHttp(_) => 502,

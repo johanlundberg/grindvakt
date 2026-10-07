@@ -560,7 +560,7 @@ pub async fn fetch_jwks_response(
     let jwks = JwkSet::from_json(&resp.text()).map_err(Error::from)?;
     Ok(JwksResponse {
         jwks,
-        cache_control: resp.cache_control().map(str::to_string),
+        cache_control: resp.cache_control(),
         etag: resp.header("etag").map(str::to_string),
     })
 }
@@ -738,7 +738,7 @@ impl<'a> IdTokenOptions<'a> {
         self
     }
 
-    /// Require `auth_time` to be no older than `seconds` (plus leeway).
+    /// Require `auth_time` to be no older than `seconds`. Leeway is not added.
     pub fn with_max_age(mut self, seconds: u64) -> Self {
         self.max_age = Some(seconds);
         self
@@ -886,8 +886,8 @@ pub fn verify_id_token_with(
         let auth_time = claims
             .extra
             .get("auth_time")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| Error::Authn("id_token missing auth_time required by max_age".into()))?;
+            .ok_or_else(|| Error::Authn("id_token missing auth_time required by max_age".into()))
+            .and_then(auth_time_secs)?;
         let now = now_secs();
         // Skew tolerance is not added to max_age: it is a session-age policy.
         if now > auth_time.saturating_add(max_age) {
@@ -952,6 +952,21 @@ fn check_token_hash(
     Ok(())
 }
 
+/// Read `auth_time` as seconds: any JSON number, with fractions floored.
+/// Negative, non-finite and non-numeric values are rejected.
+fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
+    let invalid = || Error::Authn("id_token auth_time is not a valid number".into());
+    let number = value.as_number().ok_or_else(invalid)?;
+    if let Some(secs) = number.as_u64() {
+        return Ok(secs);
+    }
+    match number.as_f64() {
+        // `as` saturates at u64::MAX for huge values.
+        Some(f) if f.is_finite() && f >= 0.0 => Ok(f.floor() as u64),
+        _ => Err(invalid()),
+    }
+}
+
 /// Verify a signed (`application/jwt`) UserInfo response and bind it to the
 /// id_token subject (OIDC Core §5.3.2).
 ///
@@ -961,6 +976,10 @@ fn check_token_hash(
 /// the verified claims as a JSON object. Rejects responses whose media type is
 /// not `application/jwt`; use [`userinfo_json_claims`] for JSON. Encrypted
 /// (JWE) responses are not supported.
+///
+/// `exp` is checked only if present. OIDC Core §5.3.2 does not require `exp`
+/// in signed UserInfo, so requiring it is opt-in: pass `require_exp = true` if
+/// your OP emits it, and tokens without `exp` are then rejected.
 pub fn userinfo_signed_claims(
     jwks: &JwkSet,
     resp: &HttpFetchResponse,
@@ -968,6 +987,7 @@ pub fn userinfo_signed_claims(
     client_id: &str,
     expected_sub: &str,
     allowed_algorithms: &[JwsAlgorithm],
+    require_exp: bool,
 ) -> Result<serde_json::Value> {
     if allowed_algorithms.is_empty() {
         return Err(Error::BadRequest(
@@ -988,10 +1008,13 @@ pub fn userinfo_signed_claims(
         ));
     }
     let token = resp.text();
-    let validation = Validation::new()
+    let mut validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
         .with_allowed_algorithms(allowed_algorithms.to_vec());
+    if require_exp {
+        validation = validation.require_exp();
+    }
     let claims = jwt::verify_with_jwks(jwks, token.trim(), &validation)?;
     if claims.sub.as_deref() != Some(expected_sub) {
         return Err(Error::Authn(
@@ -1137,7 +1160,11 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
 /// `error` (RFC 6749 §5.2); otherwise from the `WWW-Authenticate` header.
 /// `message` is the full `Display` text. `auth_failure` marks token and
 /// UserInfo requests, which 0.8 reported as `Error::Authn`.
-fn upstream_error(message: String, resp: &HttpFetchResponse, auth_failure: bool) -> Error {
+pub(crate) fn upstream_error(
+    message: String,
+    resp: &HttpFetchResponse,
+    auth_failure: bool,
+) -> Error {
     let mut error = None;
     let mut description = None;
     if let Ok(serde_json::Value::Object(obj)) =
@@ -1585,6 +1612,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jwks_response_joins_multiple_cache_control_lines() {
+        let (_, _, key) = client_and_provider();
+        let resp = crate::http::HttpFetchResponse::new(
+            200,
+            key.to_public_jwks().to_json().unwrap().into_bytes(),
+        )
+        .with_header("Cache-Control", "max-age=3600")
+        .with_header("Cache-Control", "no-store");
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(resp),
+            post: None,
+        });
+        let r = fetch_jwks_response(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.cache_control.as_deref(), Some("max-age=3600, no-store"));
+        assert_eq!(r.cache_ttl_secs(), Some(0));
+    }
+
+    #[tokio::test]
     async fn fetch_jwks_response_non_200_is_structured_error() {
         let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
             get: Some(crate::http::HttpFetchResponse::new(503, "")),
@@ -2021,38 +2072,70 @@ mod tests {
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
 
         let (resp, jwks) = signed_userinfo(&key, |_| {});
-        let v = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &es).unwrap();
+        let v = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &es, false).unwrap();
         assert_eq!(v["sub"], "subject");
 
         // Wrong subject, issuer and audience are rejected.
-        assert!(userinfo_signed_claims(&jwks, &resp, iss, aud, "other", &es).is_err());
-        assert!(userinfo_signed_claims(&jwks, &resp, "https://evil", aud, "subject", &es).is_err());
-        assert!(userinfo_signed_claims(&jwks, &resp, iss, "other-rp", "subject", &es).is_err());
+        assert!(userinfo_signed_claims(&jwks, &resp, iss, aud, "other", &es, false).is_err());
+        assert!(
+            userinfo_signed_claims(&jwks, &resp, "https://evil", aud, "subject", &es, false)
+                .is_err()
+        );
+        assert!(
+            userinfo_signed_claims(&jwks, &resp, iss, "other-rp", "subject", &es, false).is_err()
+        );
 
         // A signature from a different key is rejected.
         let (_, _, other) = client_and_provider();
-        assert!(
-            userinfo_signed_claims(&other.to_public_jwks(), &resp, iss, aud, "subject", &es)
-                .is_err()
-        );
+        assert!(userinfo_signed_claims(
+            &other.to_public_jwks(),
+            &resp,
+            iss,
+            aud,
+            "subject",
+            &es,
+            false
+        )
+        .is_err());
 
         // Algorithm allow-list is enforced; an empty list is a configuration error.
-        assert!(
-            userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[JwsAlgorithm::RS256])
-                .is_err()
-        );
-        let err = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[]).unwrap_err();
+        assert!(userinfo_signed_claims(
+            &jwks,
+            &resp,
+            iss,
+            aud,
+            "subject",
+            &[JwsAlgorithm::RS256],
+            false
+        )
+        .is_err());
+        let err =
+            userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[], false).unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
 
         // A JSON-typed response is not accepted as signed userinfo.
         let json = json_userinfo("application/json");
-        assert!(userinfo_signed_claims(&jwks, &json, iss, aud, "s1", &es).is_err());
+        assert!(userinfo_signed_claims(&jwks, &json, iss, aud, "s1", &es, false).is_err());
 
         // A tampered token fails verification.
         let mut bad = resp.clone();
         let n = bad.body.len();
         bad.body[n - 3] = if bad.body[n - 3] == b'A' { b'B' } else { b'A' };
-        assert!(userinfo_signed_claims(&jwks, &bad, iss, aud, "subject", &es).is_err());
+        assert!(userinfo_signed_claims(&jwks, &bad, iss, aud, "subject", &es, false).is_err());
+    }
+
+    #[test]
+    fn userinfo_signed_claims_require_exp_is_opt_in() {
+        let (_c, _p, key) = client_and_provider();
+        let es = [JwsAlgorithm::ES256];
+        let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
+
+        let (no_exp, jwks) = signed_userinfo(&key, |c| c.exp = None);
+        userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, false).unwrap();
+        assert!(userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, true).is_err());
+
+        let (with_exp, jwks) = signed_userinfo(&key, |_| {});
+        userinfo_signed_claims(&jwks, &with_exp, iss, aud, "subject", &es, true).unwrap();
     }
 
     #[test]
@@ -2394,6 +2477,36 @@ mod tests {
             c.extra.insert("auth_time".into(), 1.5.into());
         });
         assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        // Float auth_time values are accepted as numbers (fraction floored).
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra
+                .insert("auth_time".into(), serde_json::json!((now - 10) as f64));
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), serde_json::json!(1.0e9));
+        });
+        let err = verify_with(&jwks, &t, es, &opts).unwrap_err();
+        assert!(err.to_string().contains("older than max_age"), "{err}");
+
+        // Non-numbers and negative values are invalid, not "missing".
+        for bad in [
+            serde_json::json!("123"),
+            serde_json::json!(-5),
+            serde_json::json!(-5.5),
+            serde_json::json!(null),
+        ] {
+            let (t, jwks) = opts_token(&key, |c| {
+                c.extra.insert("auth_time".into(), bad.clone());
+            });
+            let err = verify_with(&jwks, &t, es, &opts).unwrap_err();
+            assert!(
+                err.to_string().contains("auth_time is not a valid number"),
+                "{bad}: {err}"
+            );
+        }
 
         // Old iat (still within exp) but recent auth_time: max_age is not iat-based.
         let (t, jwks) = opts_token(&key, |c| {

@@ -220,9 +220,24 @@ impl HttpFetchResponse {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The `Cache-Control` header value, if present.
-    pub fn cache_control(&self) -> Option<&str> {
-        self.header("cache-control")
+    /// All header values with this name, in order, compared case-insensitively.
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// The `Cache-Control` value, if present. Multiple field lines are joined
+    /// with `", "` (a comma-separated list, RFC 9110 §5.3).
+    pub fn cache_control(&self) -> Option<String> {
+        let values = self.header_values("cache-control");
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.join(", "))
+        }
     }
 
     pub fn text(&self) -> String {
@@ -321,8 +336,26 @@ mod tests {
     #[test]
     fn cache_control_reads_header() {
         let r = HttpFetchResponse::new(200, Vec::new()).with_header("Cache-Control", "max-age=60");
-        assert_eq!(r.cache_control(), Some("max-age=60"));
+        assert_eq!(r.cache_control().as_deref(), Some("max-age=60"));
         assert_eq!(HttpFetchResponse::default().cache_control(), None);
+    }
+
+    #[test]
+    fn header_values_returns_all_in_order() {
+        let r = HttpFetchResponse::new(200, "x")
+            .with_header("X-Thing", "one")
+            .with_header("Other", "z")
+            .with_header("x-thing", "two");
+        assert_eq!(r.header_values("X-THING"), vec!["one", "two"]);
+        assert!(r.header_values("missing").is_empty());
+    }
+
+    #[test]
+    fn cache_control_joins_multiple_lines() {
+        let r = HttpFetchResponse::new(200, "x")
+            .with_header("Cache-Control", "max-age=3600")
+            .with_header("cache-control", "no-store");
+        assert_eq!(r.cache_control().as_deref(), Some("max-age=3600, no-store"));
     }
 
     #[test]

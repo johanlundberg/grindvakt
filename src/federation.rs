@@ -180,11 +180,15 @@ pub async fn fetch_entity_configuration(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!(
-            "entity config fetch {} returned {}",
-            display_safe(&url),
-            resp.status
-        )));
+        return Err(crate::rp::upstream_error(
+            format!(
+                "internal error: entity config fetch {} returned {}",
+                display_safe(&url),
+                resp.status
+            ),
+            &resp,
+            false,
+        ));
     }
     Ok(resp.text())
 }
@@ -256,11 +260,15 @@ async fn resolve_one(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(Error::Authn(format!(
-            "resolve endpoint returned {} for {}",
-            resp.status,
-            display_safe(sub)
-        )));
+        return Err(crate::rp::upstream_error(
+            format!(
+                "authentication error: resolve endpoint returned {} for {}",
+                resp.status,
+                display_safe(sub)
+            ),
+            &resp,
+            false,
+        ));
     }
 
     // 4. Verify the resolve response (signed by the trust anchor). A resolve
@@ -425,10 +433,11 @@ pub async fn entity_metadata_jwks(
         crate::rp::validate_service_endpoint_for_issuer("jwks_uri", uri, subject_entity_id)?;
         let resp = http.get(uri).await?;
         if resp.status != 200 {
-            return Err(Error::Internal(format!(
-                "jwks fetch failed ({})",
-                resp.status
-            )));
+            return Err(crate::rp::upstream_error(
+                format!("internal error: jwks fetch failed ({})", resp.status),
+                &resp,
+                false,
+            ));
         }
         return JwkSet::from_json(&resp.text()).map_err(Error::from);
     }
@@ -454,10 +463,14 @@ pub async fn fetch_signed_jwks(
     )?;
     let resp = http.get(signed_jwks_uri).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!(
-            "signed_jwks_uri fetch failed ({})",
-            resp.status
-        )));
+        return Err(crate::rp::upstream_error(
+            format!(
+                "internal error: signed_jwks_uri fetch failed ({})",
+                resp.status
+            ),
+            &resp,
+            false,
+        ));
     }
     if let Some(content_type) = resp.content_type.as_deref() {
         if !content_type.starts_with("application/jwk-set+jwt") {
@@ -530,11 +543,15 @@ pub async fn fetch_collection(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!(
-            "collection endpoint {} returned {}",
-            display_safe(&url),
-            resp.status
-        )));
+        return Err(crate::rp::upstream_error(
+            format!(
+                "internal error: collection endpoint {} returned {}",
+                display_safe(&url),
+                resp.status
+            ),
+            &resp,
+            false,
+        ));
     }
     let body: Value = resp.json()?;
     Ok(parse_collection(&body, entity_type))
@@ -1004,6 +1021,124 @@ mod tests {
         assert!(
             extract_resolved_entity(&bad_resolved, ta, subject, &ta_key.to_public_jwks()).is_err(),
             "subordinate statements must verify against the next entity's jwks"
+        );
+    }
+
+    /// Serves `ec` for entity configuration URLs and `status` for any other GET.
+    struct RoutedHttp {
+        ec: Option<String>,
+        status: u16,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for RoutedHttp {
+        async fn get(&self, url: &str) -> Result<crate::http::HttpFetchResponse> {
+            match &self.ec {
+                Some(ec) if url.ends_with("/.well-known/openid-federation") => {
+                    Ok(crate::http::HttpFetchResponse::new(200, ec.clone()))
+                }
+                _ => Ok(crate::http::HttpFetchResponse::new(self.status, "")),
+            }
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _form: &[(String, String)],
+            _headers: &[(String, String)],
+        ) -> Result<crate::http::HttpFetchResponse> {
+            Err(Error::Internal("unexpected POST".into()))
+        }
+    }
+
+    fn assert_upstream(err: &Error, status: u16, text: &str) {
+        let up = err.upstream_http().expect("structured upstream error");
+        assert_eq!(up.status, Some(status));
+        assert!(!err.is_auth_failure());
+        assert_eq!(err.to_string(), text);
+    }
+
+    #[tokio::test]
+    async fn federation_non_200_fetches_are_upstream_http_errors() {
+        let http: Arc<dyn HttpClient> = Arc::new(RoutedHttp {
+            ec: None,
+            status: 503,
+        });
+        let jwks = key("subject").to_public_jwks();
+
+        let err = entity_metadata_jwks(
+            &http,
+            &serde_json::json!({ "jwks_uri": "https://op.example/jwks" }),
+            "https://op.example",
+            &jwks,
+        )
+        .await
+        .unwrap_err();
+        assert_upstream(&err, 503, "internal error: jwks fetch failed (503)");
+
+        let err = fetch_signed_jwks(
+            &http,
+            "https://op.example/sjwks",
+            "https://op.example",
+            &jwks,
+        )
+        .await
+        .unwrap_err();
+        assert_upstream(
+            &err,
+            503,
+            "internal error: signed_jwks_uri fetch failed (503)",
+        );
+
+        let err = fetch_entity_configuration(&http, "https://op.example")
+            .await
+            .unwrap_err();
+        assert_upstream(
+            &err,
+            503,
+            "internal error: entity config fetch https://op.example/.well-known/openid-federation returned 503",
+        );
+
+        let err = fetch_collection(&http, "https://ta.example/collection", "openid_provider")
+            .await
+            .unwrap_err();
+        assert_eq!(err.upstream_http().map(|u| u.status), Some(Some(503)));
+        assert!(err
+            .to_string()
+            .starts_with("internal error: collection endpoint "));
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoint_404_is_upstream_http_error() {
+        let ta_key = key("ta");
+        let ta = "https://ta.example.com";
+        let ta_ec = build_entity_configuration(
+            &ta_key,
+            ta,
+            &ta_key.to_public_jwks(),
+            &[],
+            serde_json::json!({
+                "federation_entity": {
+                    "federation_resolve_endpoint": "https://ta.example.com/resolve"
+                }
+            }),
+            &[],
+            3600,
+        )
+        .unwrap();
+        let http: Arc<dyn HttpClient> = Arc::new(RoutedHttp {
+            ec: Some(ta_ec),
+            status: 404,
+        });
+        let mut anchors = TrustAnchors::new();
+        anchors.insert(ta.to_string(), ta_key.to_public_jwks());
+        let err = resolve_via_trust_anchors(&http, "https://rp.example.com", &anchors)
+            .await
+            .unwrap_err();
+        assert_upstream(
+            &err,
+            404,
+            "authentication error: resolve endpoint returned 404 for https://rp.example.com",
         );
     }
 
