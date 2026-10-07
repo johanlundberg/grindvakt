@@ -9,7 +9,6 @@ use crate::client::{
     Client, ClientStore, AUTH_CLIENT_SECRET_BASIC, AUTH_CLIENT_SECRET_POST, AUTH_NONE,
     AUTH_PRIVATE_KEY_JWT,
 };
-use crate::error::display_safe;
 use crate::jwt;
 use crate::keys::SigningKey;
 use crate::mac::sha256;
@@ -756,7 +755,7 @@ impl Provider {
             }
             other => Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedGrantType,
-                format!("unsupported grant_type: {}", display_safe(other)),
+                format!("unsupported grant_type: {other}"),
             )),
         }
     }
@@ -1533,8 +1532,7 @@ fn unique_parameters(params: &[(String, String)]) -> Result<BTreeMap<String, Str
     for (name, value) in params {
         if unique.insert(name.clone(), value.clone()).is_some() {
             return Err(OAuthError::invalid_request(format!(
-                "duplicate token parameter: {}",
-                display_safe(name)
+                "duplicate token parameter: {name}"
             )));
         }
     }

@@ -1,6 +1,5 @@
 //! Parsing and validation of OIDC authorization requests.
 
-use crate::error::display_safe;
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,8 +67,7 @@ impl AuthorizationRequest {
             }
             if unique.insert(name.clone(), value.clone()).is_some() {
                 return Err(OAuthError::invalid_request(format!(
-                    "duplicate authorization parameter: {}",
-                    display_safe(name)
+                    "duplicate authorization parameter: {name}"
                 )));
             }
         }
@@ -232,10 +230,7 @@ impl AuthorizationRequest {
         if !supported {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedResponseType,
-                format!(
-                    "unsupported response_type: {}",
-                    display_safe(&self.response_type)
-                ),
+                format!("unsupported response_type: {}", self.response_type),
             )
             .with_state(self.state.clone()));
         }
@@ -265,7 +260,7 @@ impl AuthorizationRequest {
             .with_state(self.state.clone())),
             Some(other) => Err(OAuthError::invalid_request(format!(
                 "unsupported response_mode: {}",
-                display_safe(other)
+                other
             ))
             .with_state(self.state.clone())),
         }
