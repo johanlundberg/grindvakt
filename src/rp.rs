@@ -5,7 +5,7 @@
 
 use crate::error::{
     display_safe, escape_upstream_text, is_bidi_format, parse_www_authenticate_bearer,
-    split_unquoted_commas, Error, Result, UpstreamHttpError,
+    quotes_balanced, split_unquoted_commas, Error, Result, UpstreamHttpError,
 };
 use crate::http::{HttpClient, HttpFetchResponse};
 use crate::jwt;
@@ -546,6 +546,11 @@ impl JwksResponse {
     /// input never panics.
     pub fn advertised_ttl_secs(&self) -> Option<u64> {
         let header = self.cache_control.as_deref()?;
+        // An unterminated quote hides every later directive (a `no-store` after
+        // it would be swallowed): treat the field as unusable, fail closed.
+        if !quotes_balanced(header) {
+            return Some(0);
+        }
         let mut max_age = None;
         for directive in split_unquoted_commas(header) {
             let directive = directive.trim();
@@ -1813,9 +1818,24 @@ mod tests {
         // Escaped quotes do not end the quoted string early.
         let r = jwks_response_with(Some(r#"foo="a\", max-age=999", max-age=15"#)).await;
         assert_eq!(r.advertised_ttl_secs(), Some(15));
-        // An unterminated quote swallows the rest rather than yielding a lifetime.
-        let r = jwks_response_with(Some(r#"foo="oops, max-age=500"#)).await;
-        assert_eq!(r.advertised_ttl_secs(), None);
+        // An unterminated quote makes the field unusable: fail closed, so a
+        // `no-store` hidden after it cannot turn into a long lifetime.
+        for header in [
+            r#"foo="oops, max-age=500"#,
+            r#"max-age=3600, x="a, no-store"#,
+            r#"max-age=3600, x="a"#,
+            r#"max-age=3600, x=", no-store, y=1"#,
+            r#"max-age=3600, x="a\""#,
+        ] {
+            let r = jwks_response_with(Some(header)).await;
+            assert_eq!(r.advertised_ttl_secs(), Some(0), "{header}");
+            assert_eq!(r.cache_ttl_secs(), Some(0), "{header}");
+        }
+        // Controls: closed quotes keep working in either order.
+        let r = jwks_response_with(Some(r#"max-age=3600, x="a", no-store"#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(0));
+        let r = jwks_response_with(Some(r#"max-age=3600, x="a, b""#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(3600));
         // Real directives around quoted values still work.
         let r = jwks_response_with(Some(r#"max-age=20, foo="x,y""#)).await;
         assert_eq!(r.advertised_ttl_secs(), Some(20));

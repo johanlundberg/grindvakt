@@ -216,6 +216,25 @@ pub(crate) fn split_unquoted_commas(value: &str) -> Vec<&str> {
     out
 }
 
+/// Whether every quoted string in `value` is closed, scanning exactly as
+/// [`split_unquoted_commas`] does (backslash escapes inside quotes). An
+/// unterminated quote makes everything after it a single opaque element, so a
+/// caller that makes a security decision on list elements must treat the value
+/// as unusable.
+pub(crate) fn quotes_balanced(value: &str) -> bool {
+    let (mut in_quotes, mut escaped) = (false, false);
+    for c in value.chars() {
+        if escaped {
+            escaped = false;
+        } else if in_quotes && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            in_quotes = !in_quotes;
+        }
+    }
+    !in_quotes
+}
+
 /// One `name=value` auth-param (RFC 9110 §11.2). `None` if malformed, for
 /// example an unterminated or trailing-garbage quoted string.
 fn parse_auth_param(item: &str) -> Option<(String, String)> {
@@ -433,6 +452,16 @@ mod tests {
         assert!(parse_www_authenticate_bearer("Bearer error=\"unterminated").is_none());
         assert!(parse_www_authenticate_bearer("Bearer garbage").is_none());
         assert!(parse_www_authenticate_bearer("Bearer error=\"a\\").is_none());
+    }
+
+    #[test]
+    fn quotes_balanced_detects_unterminated_quotes() {
+        assert!(quotes_balanced(""));
+        assert!(quotes_balanced(r#"a="x, y", b=2"#));
+        assert!(quotes_balanced(r#"a="x\"y""#));
+        assert!(!quotes_balanced(r#"a="x"#));
+        assert!(!quotes_balanced(r#"a="x\""#));
+        assert!(!quotes_balanced(r#"a="x", b=""#));
     }
 
     #[test]
