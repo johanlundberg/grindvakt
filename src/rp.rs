@@ -485,6 +485,68 @@ pub async fn fetch_jwks(
     jwks_uri: &str,
     issuer: &str,
 ) -> Result<JwkSet> {
+    fetch_jwks_response(http, jwks_uri, issuer)
+        .await
+        .map(|r| r.jwks)
+}
+
+/// A fetched JWK Set plus the response metadata needed to cache it.
+///
+/// The library does no caching itself. Applications that cache the key set
+/// should cap or choose their own TTLs (see [`JwksResponse::cache_ttl_secs`])
+/// and must not cache error responses.
+#[derive(Debug, Clone)]
+pub struct JwksResponse {
+    pub jwks: JwkSet,
+    /// Raw `Cache-Control` header value, if any.
+    pub cache_control: Option<String>,
+    /// Raw `ETag` header value, if any.
+    pub etag: Option<String>,
+}
+
+impl JwksResponse {
+    /// Freshness lifetime in seconds derived from `Cache-Control`.
+    ///
+    /// Returns `Some(0)` when `no-store` or `no-cache` is present, otherwise
+    /// the `max-age` value. Directive names are case-insensitive, a quoted
+    /// `max-age="N"` is tolerated and the first valid `max-age` wins.
+    /// `s-maxage` is ignored because this is a private client cache. Returns
+    /// `None` when the header is absent or has no usable directive, so the
+    /// caller picks its own default. Malformed input never panics.
+    pub fn cache_ttl_secs(&self) -> Option<u64> {
+        let header = self.cache_control.as_deref()?;
+        let mut max_age = None;
+        for directive in header.split(',') {
+            let directive = directive.trim();
+            let (name, value) = match directive.split_once('=') {
+                Some((n, v)) => (n.trim(), Some(v.trim())),
+                None => (directive, None),
+            };
+            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
+                return Some(0);
+            }
+            if max_age.is_none() && name.eq_ignore_ascii_case("max-age") {
+                max_age = value
+                    .map(|v| v.trim_matches('"'))
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|v| v.parse::<u64>().ok());
+            }
+        }
+        max_age
+    }
+}
+
+/// Like [`fetch_jwks`] but also returns `Cache-Control` and `ETag` so callers
+/// can cache the key set.
+///
+/// The library does no caching itself: cap or choose TTLs yourself, and do not
+/// cache error responses. This relies on the [`HttpClient`] filling
+/// [`HttpFetchResponse::headers`]; without it both fields are `None`.
+pub async fn fetch_jwks_response(
+    http: &Arc<dyn HttpClient>,
+    jwks_uri: &str,
+    issuer: &str,
+) -> Result<JwksResponse> {
     validate_issuer(issuer)?;
     validate_service_endpoint_for_issuer("jwks_uri", jwks_uri, issuer)?;
     let resp = http.get(jwks_uri).await?;
@@ -495,7 +557,12 @@ pub async fn fetch_jwks(
             false,
         ));
     }
-    JwkSet::from_json(&resp.text()).map_err(Error::from)
+    let jwks = JwkSet::from_json(&resp.text()).map_err(Error::from)?;
+    Ok(JwksResponse {
+        jwks,
+        cache_control: resp.cache_control().map(str::to_string),
+        etag: resp.header("etag").map(str::to_string),
+    })
 }
 
 /// Exchange an authorization code for tokens.
@@ -1462,6 +1529,76 @@ mod tests {
         .await
         .expect("loopback issuer may fetch a loopback HTTP JWKS");
         assert_eq!(fetched.keys.len(), 1);
+    }
+
+    async fn jwks_response_with(cache_control: Option<&str>) -> JwksResponse {
+        let (_, _, key) = client_and_provider();
+        let mut resp = crate::http::HttpFetchResponse {
+            status: 200,
+            body: key.to_public_jwks().to_json().unwrap().into_bytes(),
+            content_type: Some("application/json".into()),
+            ..Default::default()
+        };
+        if let Some(cc) = cache_control {
+            resp = resp.with_header("Cache-Control", cc);
+        }
+        resp = resp.with_header("ETag", "\"abc\"");
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(resp),
+            post: None,
+        });
+        fetch_jwks_response(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn jwks_response_keeps_headers_and_ttl() {
+        let r = jwks_response_with(Some("public, max-age=300")).await;
+        assert_eq!(r.cache_ttl_secs(), Some(300));
+        assert_eq!(r.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(r.cache_control.as_deref(), Some("public, max-age=300"));
+        assert_eq!(r.jwks.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn jwks_response_ttl_parsing() {
+        for (header, expected) in [
+            ("no-store", Some(0)),
+            ("no-cache, max-age=60", Some(0)),
+            ("MAX-AGE=30", Some(30)),
+            ("max-age=\"45\"", Some(45)),
+            ("max-age=abc", None),
+            ("max-age=abc, max-age=7", Some(7)),
+            ("s-maxage=10", None),
+            ("max-age=", None),
+            (",,=,", None),
+        ] {
+            let r = jwks_response_with(Some(header)).await;
+            assert_eq!(r.cache_ttl_secs(), expected, "{header}");
+        }
+        assert_eq!(jwks_response_with(None).await.cache_ttl_secs(), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_jwks_response_non_200_is_structured_error() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(503, "")),
+            post: None,
+        });
+        let err = fetch_jwks_response(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.upstream_http().expect("upstream").status, Some(503));
+        assert!(err.to_string().contains("jwks fetch failed (503)"));
     }
 
     #[tokio::test]
