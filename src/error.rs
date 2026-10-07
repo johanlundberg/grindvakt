@@ -76,6 +76,7 @@ pub struct UpstreamHttpError {
     /// Response body, escaped and length capped.
     pub body: Option<String>,
     message: String,
+    auth_failure: bool,
 }
 
 impl UpstreamHttpError {
@@ -85,6 +86,7 @@ impl UpstreamHttpError {
         error_description: Option<String>,
         body: Option<String>,
         message: String,
+        auth_failure: bool,
     ) -> Self {
         Self {
             status,
@@ -92,7 +94,15 @@ impl UpstreamHttpError {
             error_description,
             body,
             message,
+            auth_failure,
         }
+    }
+
+    /// Whether the failed exchange was an authentication step (token or
+    /// UserInfo request) as opposed to metadata retrieval (discovery, JWKS).
+    /// Before 0.9 such failures were reported as [`Error::Authn`].
+    pub fn is_auth_failure(&self) -> bool {
+        self.auth_failure
     }
 
     /// The human-readable message (also the `Display` text).
@@ -221,6 +231,18 @@ impl Error {
     }
 
     /// Suggested HTTP status code for surfacing this error to a client.
+    /// Whether this error is an authentication failure: [`Error::Authn`], or an
+    /// [`Error::UpstreamHttp`] from a token or UserInfo request (which 0.8
+    /// reported as `Authn`). Prefer this to matching variant identity at
+    /// re-authentication, session-teardown and alerting decision points.
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            Error::Authn(_) => true,
+            Error::UpstreamHttp(e) => e.is_auth_failure(),
+            _ => false,
+        }
+    }
+
     pub fn status_hint(&self) -> u16 {
         match self {
             Error::UpstreamHttp(_) => 502,

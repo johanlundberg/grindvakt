@@ -287,6 +287,7 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
                 resp.status
             ),
             &resp,
+            false,
         ));
     }
     let metadata: ProviderMetadata = resp.json()?;
@@ -483,6 +484,7 @@ pub async fn fetch_jwks(
         return Err(upstream_error(
             format!("internal error: jwks fetch failed ({})", resp.status),
             &resp,
+            false,
         ));
     }
     JwkSet::from_json(&resp.text()).map_err(Error::from)
@@ -532,6 +534,7 @@ pub async fn exchange_code(
                 sanitize_error_body(&resp.text())
             ),
             &resp,
+            true,
         ));
     }
     let raw: serde_json::Value = resp.json()?;
@@ -900,6 +903,7 @@ pub async fn fetch_userinfo_response(
         return Err(upstream_error(
             format!("authentication error: userinfo returned {}", resp.status),
             &resp,
+            true,
         ));
     }
     Ok(resp)
@@ -974,8 +978,9 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
 ///
 /// `error` / `error_description` come from a JSON object body with a string
 /// `error` (RFC 6749 §5.2); otherwise from the `WWW-Authenticate` header.
-/// `message` is the full `Display` text.
-fn upstream_error(message: String, resp: &HttpFetchResponse) -> Error {
+/// `message` is the full `Display` text. `auth_failure` marks token and
+/// UserInfo requests, which 0.8 reported as `Error::Authn`.
+fn upstream_error(message: String, resp: &HttpFetchResponse, auth_failure: bool) -> Error {
     let mut error = None;
     let mut description = None;
     if let Ok(serde_json::Value::Object(obj)) =
@@ -1012,6 +1017,7 @@ fn upstream_error(message: String, resp: &HttpFetchResponse) -> Error {
         description,
         body,
         message,
+        auth_failure,
     )))
 }
 
@@ -1477,6 +1483,47 @@ mod tests {
             get: None,
             post: Some(resp),
         })
+    }
+
+    #[tokio::test]
+    async fn upstream_errors_classify_auth_failures() {
+        let (client, provider, _key) = client_and_provider();
+        // Token endpoint rejection: formerly Authn.
+        let http = mock_post(crate::http::HttpFetchResponse::new(400, "{}"));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        assert!(err.is_auth_failure());
+        assert!(!matches!(err, Error::Authn(_)));
+        // UserInfo rejection: formerly Authn.
+        let http = mock_post(crate::http::HttpFetchResponse::new(401, ""));
+        let err = fetch_userinfo(
+            &http,
+            "https://op.example.org/userinfo",
+            "at",
+            "sub",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_auth_failure());
+        // JWKS fetch failure: formerly Internal, not an auth failure.
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(500, "")),
+            post: None,
+        });
+        let err = fetch_jwks(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.upstream_http().is_some());
+        assert!(!err.is_auth_failure());
+        // Plain Authn still counts.
+        assert!(Error::Authn("x".into()).is_auth_failure());
+        assert!(!Error::Internal("x".into()).is_auth_failure());
     }
 
     #[tokio::test]
