@@ -996,7 +996,22 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 /// OPs commonly sign UserInfo with the same key that signs id_tokens, and the
 /// `iss`, `aud` and `sub` of both are identical. An id_token (or any other
 /// token the OP signed for this client) could therefore be replayed as a
-/// UserInfo response. Three defences apply:
+/// UserInfo response. The caller must say how the JWT is proven to be
+/// UserInfo by choosing one of three modes in [`UserinfoJwtOptions`]:
+///
+/// - **[`UserinfoJwtOptions::typed`]** (safe). Requires an exact JOSE `typ`
+///   header (RFC 8725 §3.11) that identifies UserInfo specifically. For OPs
+///   that type their UserInfo JWTs.
+/// - **[`UserinfoJwtOptions::dedicated_keys`]** (safe). The caller attests
+///   that `jwks` holds only keys the OP uses to sign UserInfo responses, never
+///   id_tokens, so a token that verifies cannot be an id_token.
+/// - **[`UserinfoJwtOptions::untyped_shared_key_compat`]** (compatibility
+///   only). For OPs that sign UserInfo and id_tokens with the same keys and
+///   set no `typ`. A fresh id_token without `nonce`, `at_hash` and `c_hash`
+///   is then indistinguishable from UserInfo and will be accepted.
+///
+/// Two further checks apply in every mode, as defence in depth. They limit
+/// replay but do not prove that a token is UserInfo:
 ///
 /// - **Age bound.** By default the token must carry `iat` and be no older than
 ///   [`UserinfoJwtOptions::max_age`] (300 seconds, plus the 60 second default
@@ -1004,12 +1019,13 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 ///   even if it has no `exp`. [`UserinfoJwtOptions::without_max_age`] removes
 ///   the bound; use it only for OPs that emit neither `iat` nor `exp`, and
 ///   accept that replay is then unbounded.
-/// - **`typ`.** [`UserinfoJwtOptions::with_typ`] requires an exact JOSE `typ`
-///   header (RFC 8725 §3.11), for OPs that type their UserInfo JWTs.
 /// - **id_token markers are refused.** After verification, a token whose
 ///   claims contain `nonce`, `at_hash` or `c_hash`, or whose `typ` header is
 ///   `id_token+jwt` or `at+jwt` (case-insensitive), is rejected as an id_token
 ///   or access token presented as UserInfo.
+///
+/// The safe path is therefore [`UserinfoJwtOptions::typed`] or
+/// [`UserinfoJwtOptions::dedicated_keys`].
 ///
 /// `exp` is checked only if present, unless
 /// [`UserinfoJwtOptions::require_exp`] is set: OIDC Core §5.3.2 does not
@@ -1052,7 +1068,16 @@ pub fn userinfo_signed_claims(
     if let Some(max_age) = options.max_age {
         validation = validation.with_max_age(max_age);
     }
-    if let Some(typ) = options.typ {
+    if let UserinfoTrust::Typed(typ) = options.trust {
+        if typ.is_empty()
+            || ["jwt", "id_token+jwt", "at+jwt"]
+                .iter()
+                .any(|generic| typ.eq_ignore_ascii_case(generic))
+        {
+            return Err(Error::BadRequest(
+                "typ must identify UserInfo specifically".into(),
+            ));
+        }
         validation = validation.with_typ(typ);
     }
     let token = token.trim();
@@ -1079,10 +1104,21 @@ pub fn userinfo_signed_claims(
 /// Default [`UserinfoJwtOptions::max_age`] in seconds.
 pub const DEFAULT_USERINFO_JWT_MAX_AGE: u64 = 300;
 
-/// Extra checks for [`userinfo_signed_claims`].
+/// How a signed UserInfo JWT is proven to be UserInfo.
+#[derive(Debug, Clone, Copy)]
+enum UserinfoTrust<'a> {
+    Typed(&'a str),
+    DedicatedKeys,
+    UntypedSharedKey,
+}
+
+/// Options for [`userinfo_signed_claims`].
 ///
-/// The struct is `#[non_exhaustive]`: construct it with
-/// [`UserinfoJwtOptions::new`] (or `default()`) and the `with_*` builders.
+/// There is no `Default` and no `new()`: construct it with one of
+/// [`typed`](Self::typed), [`dedicated_keys`](Self::dedicated_keys) or
+/// [`untyped_shared_key_compat`](Self::untyped_shared_key_compat), which
+/// state how the JWT is proven to be UserInfo, then adjust with the `with_*`
+/// builders. The struct is `#[non_exhaustive]`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UserinfoJwtOptions<'a> {
@@ -1093,26 +1129,45 @@ pub struct UserinfoJwtOptions<'a> {
     /// ("allow undated"): only for OPs that emit neither `iat` nor `exp`, and
     /// then replay is unbounded.
     pub max_age: Option<u64>,
-    /// Required JOSE `typ` header (RFC 8725 §3.11), e.g. an OP-specific value.
-    /// Default `None`.
-    pub typ: Option<&'a str>,
-}
-
-impl Default for UserinfoJwtOptions<'_> {
-    fn default() -> Self {
-        Self {
-            require_exp: false,
-            max_age: Some(DEFAULT_USERINFO_JWT_MAX_AGE),
-            typ: None,
-        }
-    }
+    trust: UserinfoTrust<'a>,
 }
 
 impl<'a> UserinfoJwtOptions<'a> {
-    /// Defaults: `exp` optional, token age bounded to 300 seconds from `iat`,
-    /// no `typ` requirement.
-    pub fn new() -> Self {
-        Self::default()
+    fn with_trust(trust: UserinfoTrust<'a>) -> Self {
+        Self {
+            require_exp: false,
+            max_age: Some(DEFAULT_USERINFO_JWT_MAX_AGE),
+            trust,
+        }
+    }
+
+    /// Require the JOSE `typ` header to equal `typ` (RFC 8725 §3.11), for OPs
+    /// that set a UserInfo-specific `typ`. This is a safe mode.
+    ///
+    /// `typ` must identify UserInfo specifically: an empty value, `JWT`,
+    /// `id_token+jwt` or `at+jwt` (case-insensitive) is refused with
+    /// [`Error::BadRequest`] when [`userinfo_signed_claims`] runs.
+    pub fn typed(typ: &'a str) -> Self {
+        Self::with_trust(UserinfoTrust::Typed(typ))
+    }
+
+    /// The caller attests that the `jwks` passed to [`userinfo_signed_claims`]
+    /// contains only keys the OP uses to sign UserInfo responses, never
+    /// id_tokens. No `typ` is required. This is a safe mode, but only as safe
+    /// as that attestation.
+    pub fn dedicated_keys() -> Self {
+        Self::with_trust(UserinfoTrust::DedicatedKeys)
+    }
+
+    /// Compatibility mode for OPs that sign UserInfo and id_tokens with the
+    /// same keys and set no `typ`.
+    ///
+    /// **Known limitation:** an id_token that omits `nonce`, `at_hash` and
+    /// `c_hash` and is fresh is indistinguishable from UserInfo and WILL be
+    /// accepted for up to [`max_age`](Self::max_age). Prefer
+    /// [`typed`](Self::typed) or [`dedicated_keys`](Self::dedicated_keys).
+    pub fn untyped_shared_key_compat() -> Self {
+        Self::with_trust(UserinfoTrust::UntypedSharedKey)
     }
 
     /// Reject tokens without `exp`.
@@ -1132,12 +1187,6 @@ impl<'a> UserinfoJwtOptions<'a> {
     /// neither `iat` nor `exp`.
     pub fn without_max_age(mut self) -> Self {
         self.max_age = None;
-        self
-    }
-
-    /// Require this JOSE `typ` header value.
-    pub fn with_typ(mut self, typ: &'a str) -> Self {
-        self.typ = Some(typ);
         self
     }
 }
@@ -2402,7 +2451,7 @@ mod tests {
     fn userinfo_signed_claims_verifies_and_binds() {
         let (_c, _p, key) = client_and_provider();
         let es = [JwsAlgorithm::ES256];
-        let o = UserinfoJwtOptions::new();
+        let o = UserinfoJwtOptions::dedicated_keys();
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
 
         let (resp, jwks) = signed_userinfo(&key, |_| {});
@@ -2458,8 +2507,8 @@ mod tests {
     fn userinfo_signed_claims_require_exp_is_opt_in() {
         let (_c, _p, key) = client_and_provider();
         let es = [JwsAlgorithm::ES256];
-        let o = UserinfoJwtOptions::new();
-        let req = UserinfoJwtOptions::new().with_require_exp();
+        let o = UserinfoJwtOptions::dedicated_keys();
+        let req = UserinfoJwtOptions::dedicated_keys().with_require_exp();
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
 
         let (no_exp, jwks) = signed_userinfo(&key, |c| c.exp = None);
@@ -2492,45 +2541,123 @@ mod tests {
         (resp, key.to_public_jwks())
     }
 
+    const USERINFO_ISS_AUD: (&str, &str) = ("https://op.example.org", "https://rp.example.com");
+
+    fn run_userinfo(
+        resp: &crate::http::HttpFetchResponse,
+        jwks: &JwkSet,
+        o: &UserinfoJwtOptions<'_>,
+    ) -> Result<serde_json::Value> {
+        let (iss, aud) = USERINFO_ISS_AUD;
+        userinfo_signed_claims(jwks, resp, iss, aud, "subject", &[JwsAlgorithm::ES256], o)
+    }
+
     #[test]
-    fn userinfo_signed_claims_rejects_id_token_claims_and_typ() {
+    fn userinfo_markers_refused_in_every_mode() {
         let (_c, _p, key) = client_and_provider();
-        let es = [JwsAlgorithm::ES256];
-        let o = UserinfoJwtOptions::new();
-        let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
-        let run =
-            |resp: &crate::http::HttpFetchResponse, jwks: &JwkSet, o: &UserinfoJwtOptions<'_>| {
-                userinfo_signed_claims(jwks, resp, iss, aud, "subject", &es, o)
-            };
-
-        let (ok, jwks) = signed_userinfo_typ(&key, None, &[("name", "A")]);
-        assert_eq!(run(&ok, &jwks, &o).unwrap()["name"], "A");
-
-        for claim in ["nonce", "at_hash", "c_hash"] {
-            let (resp, jwks) = signed_userinfo_typ(&key, None, &[(claim, "x")]);
-            let err = run(&resp, &jwks, &o).unwrap_err();
-            assert!(err.to_string().contains("id_token"), "{claim}: {err}");
+        let modes = [
+            UserinfoJwtOptions::dedicated_keys(),
+            UserinfoJwtOptions::untyped_shared_key_compat(),
+        ];
+        for o in &modes {
+            let (ok, jwks) = signed_userinfo_typ(&key, None, &[("name", "A")]);
+            assert_eq!(run_userinfo(&ok, &jwks, o).unwrap()["name"], "A");
+            for claim in ["nonce", "at_hash", "c_hash"] {
+                let (resp, jwks) = signed_userinfo_typ(&key, None, &[(claim, "x")]);
+                let err = run_userinfo(&resp, &jwks, o).unwrap_err();
+                assert!(err.to_string().contains("id_token"), "{claim}: {err}");
+            }
+            for typ in ["id_token+jwt", "ID_Token+JWT", "at+jwt"] {
+                let (resp, jwks) = signed_userinfo_typ(&key, Some(typ), &[]);
+                assert!(run_userinfo(&resp, &jwks, o).is_err(), "{typ}");
+            }
         }
-        for typ in ["id_token+jwt", "ID_Token+JWT", "at+jwt"] {
-            let (resp, jwks) = signed_userinfo_typ(&key, Some(typ), &[]);
-            assert!(run(&resp, &jwks, &o).is_err(), "{typ}");
-        }
+        // typed(): markers are refused even when the typ matches.
+        let typed = UserinfoJwtOptions::typed("userinfo+jwt");
+        let (resp, jwks) = signed_userinfo_typ(&key, Some("userinfo+jwt"), &[("nonce", "x")]);
+        assert!(run_userinfo(&resp, &jwks, &typed).is_err());
+    }
 
-        // with_typ requires an exact header match.
-        let want = UserinfoJwtOptions::new().with_typ("userinfo+jwt");
+    #[test]
+    fn userinfo_typed_requires_exact_typ() {
+        let (_c, _p, key) = client_and_provider();
+        let want = UserinfoJwtOptions::typed("userinfo+jwt");
         let (typed, jwks) = signed_userinfo_typ(&key, Some("userinfo+jwt"), &[]);
-        run(&typed, &jwks, &want).unwrap();
+        run_userinfo(&typed, &jwks, &want).unwrap();
         let (untyped, jwks) = signed_userinfo_typ(&key, None, &[]);
-        assert!(run(&untyped, &jwks, &want).is_err());
-        run(&untyped, &jwks, &o).unwrap();
+        assert!(run_userinfo(&untyped, &jwks, &want).is_err());
+        let (other, jwks) = signed_userinfo_typ(&key, Some("other+jwt"), &[]);
+        assert!(run_userinfo(&other, &jwks, &want).is_err());
+    }
+
+    #[test]
+    fn userinfo_typed_rejects_generic_typ() {
+        let (_c, _p, key) = client_and_provider();
+        let (resp, jwks) = signed_userinfo_typ(&key, Some("userinfo+jwt"), &[]);
+        for typ in ["", "JWT", "jwt", "id_token+jwt", "ID_TOKEN+JWT", "at+jwt"] {
+            let err = run_userinfo(&resp, &jwks, &UserinfoJwtOptions::typed(typ)).unwrap_err();
+            assert!(matches!(err, Error::BadRequest(_)), "{typ:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn userinfo_dedicated_keys_accepts_untyped_token() {
+        let (_c, _p, key) = client_and_provider();
+        let (resp, jwks) = signed_userinfo_typ(&key, None, &[]);
+        run_userinfo(&resp, &jwks, &UserinfoJwtOptions::dedicated_keys()).unwrap();
+    }
+
+    #[test]
+    fn compat_mode_accepts_unmarked_fresh_token_known_limitation() {
+        let (_c, _p, key) = client_and_provider();
+        // id_token-shaped (iss/sub/aud/iat/exp) but without nonce/at_hash/c_hash.
+        let (resp, jwks) = signed_userinfo(&key, |_| {});
+        let o = UserinfoJwtOptions::untyped_shared_key_compat();
+        assert_eq!(run_userinfo(&resp, &jwks, &o).unwrap()["sub"], "subject");
+    }
+
+    #[test]
+    fn userinfo_builders_apply_in_every_mode() {
+        let (_c, _p, key) = client_and_provider();
+        let modes: [fn() -> UserinfoJwtOptions<'static>; 3] = [
+            || UserinfoJwtOptions::typed("userinfo+jwt"),
+            UserinfoJwtOptions::dedicated_keys,
+            UserinfoJwtOptions::untyped_shared_key_compat,
+        ];
+        for mode in modes {
+            let typ = Some("userinfo+jwt");
+            let sign = |tweak: &dyn Fn(&mut Claims)| {
+                let (token, jwks) = opts_token_typ(&key, typ, tweak);
+                let resp = crate::http::HttpFetchResponse::new(200, token)
+                    .with_header("Content-Type", "application/jwt");
+                (resp, jwks)
+            };
+            // Age bound.
+            let (old, jwks) = sign(&|c| {
+                c.iat = Some(now_secs() - 3600);
+                c.exp = None;
+            });
+            assert!(run_userinfo(&old, &jwks, &mode()).is_err());
+            run_userinfo(&old, &jwks, &mode().without_max_age()).unwrap();
+            let (recent, jwks) = sign(&|c| {
+                c.iat = Some(now_secs() - 200);
+                c.exp = None;
+            });
+            run_userinfo(&recent, &jwks, &mode()).unwrap();
+            assert!(run_userinfo(&recent, &jwks, &mode().with_max_age(10)).is_err());
+            // require_exp.
+            let (no_exp, jwks) = sign(&|c| c.exp = None);
+            run_userinfo(&no_exp, &jwks, &mode()).unwrap();
+            assert!(run_userinfo(&no_exp, &jwks, &mode().with_require_exp()).is_err());
+        }
     }
 
     #[test]
     fn userinfo_signed_claims_age_bound() {
         let (_c, _p, key) = client_and_provider();
         let es = [JwsAlgorithm::ES256];
-        let o = UserinfoJwtOptions::new();
-        let undated = UserinfoJwtOptions::new().without_max_age();
+        let o = UserinfoJwtOptions::dedicated_keys();
+        let undated = UserinfoJwtOptions::dedicated_keys().without_max_age();
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
         let run =
             |resp: &crate::http::HttpFetchResponse, jwks: &JwkSet, o: &UserinfoJwtOptions<'_>| {
@@ -2559,7 +2686,12 @@ mod tests {
             c.exp = None;
         });
         run(&recent, &jwks, &o).unwrap();
-        assert!(run(&recent, &jwks, &UserinfoJwtOptions::new().with_max_age(10)).is_err());
+        assert!(run(
+            &recent,
+            &jwks,
+            &UserinfoJwtOptions::dedicated_keys().with_max_age(10)
+        )
+        .is_err());
     }
 
     #[test]
@@ -2731,6 +2863,14 @@ mod tests {
     }
 
     fn opts_token(key: &SigningKey, tweak: impl FnOnce(&mut Claims)) -> (String, JwkSet) {
+        opts_token_typ(key, None, tweak)
+    }
+
+    fn opts_token_typ(
+        key: &SigningKey,
+        typ: Option<&str>,
+        tweak: impl FnOnce(&mut Claims),
+    ) -> (String, JwkSet) {
         let now = now_secs();
         let mut c = Claims {
             iss: Some("https://op.example.org".into()),
@@ -2741,7 +2881,7 @@ mod tests {
             ..Default::default()
         };
         tweak(&mut c);
-        (jwt::sign(key, &c, None).unwrap(), key.to_public_jwks())
+        (jwt::sign(key, &c, typ).unwrap(), key.to_public_jwks())
     }
 
     fn verify_with(
