@@ -2183,6 +2183,8 @@ mod tests {
         .unwrap_err();
         assert!(err.upstream_http().is_some());
         assert!(!err.is_auth_failure());
+        // Metadata fetch failures are an upstream fault, not a login failure.
+        assert_eq!(err.status_hint(), 502);
         // Plain Authn still counts.
         assert!(Error::Authn("x".into()).is_auth_failure());
         assert!(!Error::Internal("x".into()).is_auth_failure());
@@ -2244,7 +2246,8 @@ mod tests {
             err.to_string(),
             "authentication error: token endpoint returned 400"
         );
-        assert_eq!(err.status_hint(), 502);
+        // Same hint as the 0.8 `Authn`, so re-login logic keyed on it still works.
+        assert_eq!(err.status_hint(), 401);
     }
 
     #[tokio::test]
@@ -2346,7 +2349,7 @@ mod tests {
             err.to_string(),
             "authentication error: userinfo returned 401"
         );
-        assert_eq!(err.status_hint(), 502);
+        assert_eq!(err.status_hint(), 401);
     }
 
     type RecordedCall = (String, String, Vec<(String, String)>);

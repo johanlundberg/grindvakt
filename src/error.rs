@@ -54,7 +54,16 @@ pub enum Error {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// An upstream HTTP exchange (token, UserInfo, JWKS, discovery) failed.
+    /// An upstream HTTP exchange (token, UserInfo, JWKS, discovery, federation
+    /// fetch) failed.
+    ///
+    /// **Migration from 0.8:** these failures used to be [`Error::Authn`]
+    /// (token and UserInfo) or [`Error::Internal`] (the rest). `Authn` still
+    /// exists, so code such as `matches!(e, Error::Authn(_))` compiles but no
+    /// longer fires for them. Use [`Error::is_auth_failure`] where `Authn`
+    /// meant "authentication failed", and [`Error::upstream_http`] for the
+    /// status and OAuth error. [`Error::status_hint`] keeps 401 for token and
+    /// UserInfo failures.
     #[error("{0}")]
     UpstreamHttp(Box<UpstreamHttpError>),
 }
@@ -337,6 +346,11 @@ impl Error {
     /// Suggested HTTP status code for surfacing this error to a client.
     pub fn status_hint(&self) -> u16 {
         match self {
+            // Token and UserInfo failures keep the 401 they had as `Authn`, so
+            // re-login logic keyed on it still fires; metadata fetches (discovery,
+            // JWKS, federation) are an upstream fault: 502, a 5xx like the 500
+            // they had as `Internal`.
+            Error::UpstreamHttp(e) if e.is_auth_failure() => 401,
             Error::UpstreamHttp(_) => 502,
             Error::NoBoundEndpoint(_) => 404,
             Error::BadRequest(_) => 400,
