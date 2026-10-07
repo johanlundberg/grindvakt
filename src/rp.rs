@@ -499,18 +499,34 @@ pub struct JwksResponse {
     pub cache_control: Option<String>,
     /// Raw `ETag` header value, if any.
     pub etag: Option<String>,
+    /// Seconds the response already spent in an upstream cache (`Age` header,
+    /// RFC 9111 §5.1), if present and a valid non-negative integer.
+    pub age: Option<u64>,
 }
 
 impl JwksResponse {
-    /// Freshness lifetime in seconds derived from `Cache-Control`.
+    /// Remaining freshness in seconds: the advertised lifetime
+    /// ([`JwksResponse::advertised_ttl_secs`]) minus [`JwksResponse::age`],
+    /// saturating at 0.
+    ///
+    /// With `Age: 3000` and `Cache-Control: max-age=3600` this is 600, not
+    /// 3600. `Some(0)` for `no-store`/`no-cache`; `None` when `Cache-Control`
+    /// gives no usable lifetime, so the caller picks its own default.
+    pub fn cache_ttl_secs(&self) -> Option<u64> {
+        self.advertised_ttl_secs()
+            .map(|ttl| ttl.saturating_sub(self.age.unwrap_or(0)))
+    }
+
+    /// Freshness lifetime in seconds as advertised by `Cache-Control`, ignoring
+    /// `Age`.
     ///
     /// Returns `Some(0)` when `no-store` or `no-cache` is present, otherwise
     /// the `max-age` value. Directive names are case-insensitive, a quoted
     /// `max-age="N"` is tolerated and the first valid `max-age` wins.
     /// `s-maxage` is ignored because this is a private client cache. Returns
-    /// `None` when the header is absent or has no usable directive, so the
-    /// caller picks its own default. Malformed input never panics.
-    pub fn cache_ttl_secs(&self) -> Option<u64> {
+    /// `None` when the header is absent or has no usable directive. Malformed
+    /// input never panics.
+    pub fn advertised_ttl_secs(&self) -> Option<u64> {
         let header = self.cache_control.as_deref()?;
         let mut max_age = None;
         for directive in header.split(',') {
@@ -559,6 +575,11 @@ pub async fn fetch_jwks_response(
         jwks,
         cache_control: resp.cache_control(),
         etag: resp.header("etag").map(str::to_string),
+        age: resp
+            .header("age")
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<u64>().ok()),
     })
 }
 
@@ -1674,6 +1695,61 @@ mod tests {
         .await
         .expect("loopback issuer may fetch a loopback HTTP JWKS");
         assert_eq!(fetched.keys.len(), 1);
+    }
+
+    async fn jwks_response_with_age(cache_control: &str, age: Option<&str>) -> JwksResponse {
+        let (_, _, key) = client_and_provider();
+        let mut resp = crate::http::HttpFetchResponse {
+            status: 200,
+            body: key.to_public_jwks().to_json().unwrap().into_bytes(),
+            content_type: Some("application/json".into()),
+            ..Default::default()
+        }
+        .with_header("Cache-Control", cache_control);
+        if let Some(age) = age {
+            resp = resp.with_header("Age", age);
+        }
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(resp),
+            post: None,
+        });
+        fetch_jwks_response(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn jwks_response_subtracts_age_from_ttl() {
+        let r = jwks_response_with_age("max-age=3600", Some("3000")).await;
+        assert_eq!(r.age, Some(3000));
+        assert_eq!(r.advertised_ttl_secs(), Some(3600));
+        assert_eq!(r.cache_ttl_secs(), Some(600));
+        // Age beyond the lifetime saturates at zero, no underflow.
+        let r = jwks_response_with_age("max-age=60", Some("99999")).await;
+        assert_eq!(r.cache_ttl_secs(), Some(0));
+        // Missing or invalid Age is treated as 0.
+        for age in [None, Some("abc"), Some("-5"), Some("")] {
+            let r = jwks_response_with_age("max-age=300", age).await;
+            assert_eq!(r.age, None, "{age:?}");
+            assert_eq!(r.cache_ttl_secs(), Some(300));
+        }
+        // No usable lifetime stays None; no-store stays 0.
+        assert_eq!(
+            jwks_response_with_age("public", Some("10"))
+                .await
+                .cache_ttl_secs(),
+            None
+        );
+        assert_eq!(
+            jwks_response_with_age("no-store", Some("10"))
+                .await
+                .cache_ttl_secs(),
+            Some(0)
+        );
     }
 
     async fn jwks_response_with(cache_control: Option<&str>) -> JwksResponse {
