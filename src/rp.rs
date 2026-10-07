@@ -940,7 +940,10 @@ pub enum UserinfoMethod {
     /// `POST` with an empty form body (the default).
     #[default]
     Post,
-    /// `GET`. Requires [`HttpClient::get_with_headers`].
+    /// `GET`. Requires [`HttpClient::get_with_headers`]. Use it only if your
+    /// `HttpClient` strips `Authorization` on a cross-origin redirect (or does
+    /// not follow redirects): the access token is sent as a Bearer header and
+    /// the redirect target is not validated by this crate.
     Get,
 }
 

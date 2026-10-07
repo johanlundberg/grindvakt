@@ -129,6 +129,17 @@ impl Response {
 /// Trait for an outbound HTTP client, injected into the OIDC/federation logic so
 /// the protocol library stays runtime-agnostic. Implemented in the binary with
 /// `reqwest`.
+///
+/// # Redirects and credentials
+///
+/// The library validates request URLs against the issuer policy, but it cannot
+/// validate where a server redirects to. Requests made through `post_form` and
+/// `get_with_headers` can carry credentials (`Authorization: Bearer`, client
+/// secrets in the form body). Implementors **must** either not follow
+/// redirects for these requests or strip `Authorization` (and drop the form
+/// body on a method change) when a redirect crosses origins; otherwise a
+/// redirecting endpoint receives the credential. The library does not and
+/// cannot enforce this.
 #[async_trait::async_trait]
 pub trait HttpClient: Send + Sync {
     /// Issue a GET and return the body bytes (and status).
@@ -146,7 +157,9 @@ pub trait HttpClient: Send + Sync {
     ///
     /// The default implementation returns an error; override it to enable GET
     /// UserInfo requests. Implementations must not forward these headers when
-    /// following redirects to another origin.
+    /// following redirects to another origin (see the trait documentation):
+    /// override this only if your client strips `Authorization` on a
+    /// cross-origin redirect or does not follow redirects.
     async fn get_with_headers(
         &self,
         url: &str,
