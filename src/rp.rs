@@ -597,7 +597,11 @@ pub struct IdTokenOptions<'a> {
     /// If set, `acr` must be present (string) and in this list. Empty list = configuration error (Error::BadRequest).
     pub acr_values: Option<&'a [&'a str]>,
     /// If set and the token has `at_hash`, it must equal oidc_token_hash(header alg, access_token).
+    /// A token without `at_hash` is accepted unless `require_at_hash` is set.
     pub access_token: Option<&'a str>,
+    /// Fail when the id_token has no `at_hash`. Requires `access_token`; without
+    /// one the options are a configuration error (`Error::BadRequest`).
+    pub require_at_hash: bool,
 }
 
 impl<'a> IdTokenOptions<'a> {
@@ -624,9 +628,21 @@ impl<'a> IdTokenOptions<'a> {
         self
     }
 
-    /// Validate `at_hash` (when present) against this access token.
+    /// Validate `at_hash` against this access token.
+    ///
+    /// This only checks `at_hash` when the id_token carries it, so an id_token
+    /// without `at_hash` is **not** bound to the access token. Combine with
+    /// [`IdTokenOptions::with_required_at_hash`] when the binding must hold, as
+    /// for implicit and hybrid flows or any flow where the OP is known to emit it.
     pub fn with_access_token(mut self, access_token: &'a str) -> Self {
         self.access_token = Some(access_token);
+        self
+    }
+
+    /// Reject id_tokens that carry no `at_hash`. Needs
+    /// [`IdTokenOptions::with_access_token`].
+    pub fn with_required_at_hash(mut self) -> Self {
+        self.require_at_hash = true;
         self
     }
 }
@@ -650,6 +666,11 @@ pub fn verify_id_token_with(
     if allowed_algorithms.is_empty() {
         return Err(Error::BadRequest(
             "at least one allowed id_token signing algorithm is required".into(),
+        ));
+    }
+    if options.require_at_hash && options.access_token.is_none() {
+        return Err(Error::BadRequest(
+            "require_at_hash needs an access_token to check against".into(),
         ));
     }
     if options.acr_values.is_some_and(<[&str]>::is_empty) {
@@ -735,6 +756,9 @@ pub fn verify_id_token_with(
         }
     }
 
+    if options.require_at_hash && !claims.extra.contains_key("at_hash") {
+        return Err(Error::Authn("id_token missing at_hash".into()));
+    }
     if let (Some(access_token), Some(at_hash)) = (options.access_token, claims.extra.get("at_hash"))
     {
         let at_hash = at_hash
@@ -1940,9 +1964,30 @@ mod tests {
         });
         assert!(verify_with(&jwks, &t, es, &opts).is_err());
 
-        // Absent at_hash is accepted even when an access token is supplied.
+        // Absent at_hash is accepted unless explicitly required.
         let (t, jwks) = opts_token(&key, |_| {});
         verify_with(&jwks, &t, es, &opts).unwrap();
+        let required = IdTokenOptions::new()
+            .with_access_token(at)
+            .with_required_at_hash();
+        assert!(verify_with(&jwks, &t, es, &required).is_err());
+        // Required and present and matching passes.
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("at_hash".into(), good.clone().into());
+        });
+        verify_with(&jwks, &t, es, &required).unwrap();
+        // Requiring at_hash without an access token is a configuration error.
+        let err = verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions {
+                require_at_hash: true,
+                ..IdTokenOptions::new()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
     }
 
     #[test]
