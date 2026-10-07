@@ -602,6 +602,12 @@ pub struct IdTokenOptions<'a> {
     /// Fail when the id_token has no `at_hash`. Requires `access_token`; without
     /// one the options are a configuration error (`Error::BadRequest`).
     pub require_at_hash: bool,
+    /// If set and the token has `c_hash`, it must equal oidc_token_hash(header alg, code).
+    /// A token without `c_hash` is accepted unless `require_c_hash` is set.
+    pub authorization_code: Option<&'a str>,
+    /// Fail when the id_token has no `c_hash`. Requires `authorization_code`;
+    /// without one the options are a configuration error (`Error::BadRequest`).
+    pub require_c_hash: bool,
 }
 
 impl<'a> IdTokenOptions<'a> {
@@ -645,6 +651,25 @@ impl<'a> IdTokenOptions<'a> {
         self.require_at_hash = true;
         self
     }
+
+    /// Validate `c_hash` against this authorization code (OIDC Core §3.3.2.11).
+    ///
+    /// Like [`IdTokenOptions::with_access_token`], this only checks `c_hash`
+    /// when the id_token carries it. Hybrid flows (`code id_token`,
+    /// `code id_token token`) must also call
+    /// [`IdTokenOptions::with_required_c_hash`] to bind the front-channel
+    /// id_token to the delivered code.
+    pub fn with_authorization_code(mut self, code: &'a str) -> Self {
+        self.authorization_code = Some(code);
+        self
+    }
+
+    /// Reject id_tokens that carry no `c_hash`. Needs
+    /// [`IdTokenOptions::with_authorization_code`].
+    pub fn with_required_c_hash(mut self) -> Self {
+        self.require_c_hash = true;
+        self
+    }
 }
 
 /// Like [`verify_id_token`] with additional [`IdTokenOptions`].
@@ -671,6 +696,11 @@ pub fn verify_id_token_with(
     if options.require_at_hash && options.access_token.is_none() {
         return Err(Error::BadRequest(
             "require_at_hash needs an access_token to check against".into(),
+        ));
+    }
+    if options.require_c_hash && options.authorization_code.is_none() {
+        return Err(Error::BadRequest(
+            "require_c_hash needs an authorization_code to check against".into(),
         ));
     }
     if options.acr_values.is_some_and(<[&str]>::is_empty) {
@@ -756,21 +786,47 @@ pub fn verify_id_token_with(
         }
     }
 
-    if options.require_at_hash && !claims.extra.contains_key("at_hash") {
-        return Err(Error::Authn("id_token missing at_hash".into()));
+    check_token_hash(
+        &claims,
+        id_token,
+        "at_hash",
+        options.access_token,
+        options.require_at_hash,
+    )?;
+    check_token_hash(
+        &claims,
+        id_token,
+        "c_hash",
+        options.authorization_code,
+        options.require_c_hash,
+    )?;
+    Ok(claims)
+}
+
+/// Check an `at_hash` / `c_hash` claim against `value` using the hash for the
+/// id_token's (already verified) JWS `alg`.
+fn check_token_hash(
+    claims: &Claims,
+    id_token: &str,
+    claim: &str,
+    value: Option<&str>,
+    required: bool,
+) -> Result<()> {
+    let present = claims.extra.get(claim);
+    if required && present.is_none() {
+        return Err(Error::Authn(format!("id_token missing {claim}")));
     }
-    if let (Some(access_token), Some(at_hash)) = (options.access_token, claims.extra.get("at_hash"))
-    {
-        let at_hash = at_hash
+    if let (Some(value), Some(present)) = (value, present) {
+        let claimed = present
             .as_str()
-            .ok_or_else(|| Error::Authn("id_token at_hash is not a string".into()))?;
+            .ok_or_else(|| Error::Authn(format!("id_token {claim} is not a string")))?;
         let alg = JwsAlgorithm::from_str(&jwt::peek_header(id_token)?.alg)?;
-        let expected = jwt::oidc_token_hash(alg, access_token)?;
-        if !crate::mac::constant_time_eq(expected.as_bytes(), at_hash.as_bytes()) {
-            return Err(Error::Authn("id_token at_hash mismatch".into()));
+        let expected = jwt::oidc_token_hash(alg, value)?;
+        if !crate::mac::constant_time_eq(expected.as_bytes(), claimed.as_bytes()) {
+            return Err(Error::Authn(format!("id_token {claim} mismatch")));
         }
     }
-    Ok(claims)
+    Ok(())
 }
 
 /// How [`fetch_userinfo_response`] sends the UserInfo request (OIDC Core §5.3.1).
@@ -1983,6 +2039,71 @@ mod tests {
             es,
             &IdTokenOptions {
                 require_at_hash: true,
+                ..IdTokenOptions::new()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn id_token_options_c_hash() {
+        let (_c, _p, key) = client_and_provider();
+        let es = JwsAlgorithm::ES256;
+        let code = "authorization-code-value";
+        let opts = IdTokenOptions::new().with_authorization_code(code);
+        let required = IdTokenOptions::new()
+            .with_authorization_code(code)
+            .with_required_c_hash();
+
+        let good = jwt::oidc_token_hash(es, code).unwrap();
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("c_hash".into(), good.clone().into());
+        });
+        verify_with(&jwks, &t, es, &opts).unwrap();
+        verify_with(&jwks, &t, es, &required).unwrap();
+        // Present without the option: not checked.
+        verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap();
+        // A different code does not match.
+        assert!(verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new().with_authorization_code("other")
+        )
+        .is_err());
+        // c_hash does not satisfy at_hash and vice versa.
+        assert!(verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new()
+                .with_access_token(code)
+                .with_required_at_hash()
+        )
+        .is_err());
+
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("c_hash".into(), "AAAA".into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+        let (t, jwks) = opts_token(&key, |c| {
+            c.extra.insert("c_hash".into(), 5.into());
+        });
+        assert!(verify_with(&jwks, &t, es, &opts).is_err());
+
+        // Absent c_hash is accepted unless required.
+        let (t, jwks) = opts_token(&key, |_| {});
+        verify_with(&jwks, &t, es, &opts).unwrap();
+        let err = verify_with(&jwks, &t, es, &required).unwrap_err();
+        assert!(err.to_string().contains("missing c_hash"));
+        // Requiring c_hash without a code is a configuration error.
+        let err = verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions {
+                require_c_hash: true,
                 ..IdTokenOptions::new()
             },
         )
