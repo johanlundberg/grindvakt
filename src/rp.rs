@@ -487,6 +487,11 @@ pub async fn fetch_jwks(
         .map(|r| r.jwks)
 }
 
+/// Ceiling in seconds applied by [`JwksResponse::cache_ttl_secs`]: 24 hours.
+/// Key rotation and revocation must take effect within this window no matter
+/// what the upstream advertises.
+pub const MAX_JWKS_CACHE_TTL_SECS: u64 = 86_400;
+
 /// A fetched JWK Set plus the response metadata needed to cache it.
 ///
 /// The library does no caching itself. Applications that cache the key set
@@ -505,20 +510,33 @@ pub struct JwksResponse {
 }
 
 impl JwksResponse {
-    /// Remaining freshness in seconds: the advertised lifetime
-    /// ([`JwksResponse::advertised_ttl_secs`]) minus [`JwksResponse::age`],
-    /// saturating at 0.
+    /// Remaining freshness in seconds, capped at [`MAX_JWKS_CACHE_TTL_SECS`]
+    /// (24 hours).
     ///
-    /// With `Age: 3000` and `Cache-Control: max-age=3600` this is 600, not
-    /// 3600. `Some(0)` for `no-store`/`no-cache`; `None` when `Cache-Control`
-    /// gives no usable lifetime, so the caller picks its own default.
+    /// This is the advertised lifetime ([`JwksResponse::advertised_ttl_secs`])
+    /// minus [`JwksResponse::age`], saturating at 0, and then limited to the
+    /// ceiling, so an upstream cannot pin a key set (and with it a revoked
+    /// signing key) for a year by advertising `max-age=31536000`. With
+    /// `Age: 3000` and `Cache-Control: max-age=3600` this is 600. `Some(0)` for
+    /// `no-store`/`no-cache`; `None` when `Cache-Control` gives no usable
+    /// lifetime, so the caller picks its own default (and should also bound
+    /// it). Use [`JwksResponse::cache_ttl_secs_max`] for a different ceiling.
     pub fn cache_ttl_secs(&self) -> Option<u64> {
+        self.cache_ttl_secs_max(MAX_JWKS_CACHE_TTL_SECS)
+    }
+
+    /// Like [`JwksResponse::cache_ttl_secs`] with a caller-chosen ceiling in
+    /// seconds.
+    pub fn cache_ttl_secs_max(&self, ceiling: u64) -> Option<u64> {
         self.advertised_ttl_secs()
-            .map(|ttl| ttl.saturating_sub(self.age.unwrap_or(0)))
+            .map(|ttl| ttl.saturating_sub(self.age.unwrap_or(0)).min(ceiling))
     }
 
     /// Freshness lifetime in seconds as advertised by `Cache-Control`, ignoring
-    /// `Age`.
+    /// `Age` and **not capped**: a hostile or misconfigured upstream controls
+    /// this value, so do not cache on it directly; use
+    /// [`JwksResponse::cache_ttl_secs`]. A digits-only `max-age` too large for
+    /// `u64` saturates to `u64::MAX` rather than being ignored.
     ///
     /// Returns `Some(0)` when `no-store` or `no-cache` is present, otherwise
     /// the `max-age` value. Directive names are case-insensitive, a quoted
@@ -542,7 +560,7 @@ impl JwksResponse {
                 max_age = value
                     .map(|v| v.trim_matches('"'))
                     .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                    .and_then(|v| v.parse::<u64>().ok());
+                    .map(|v| v.parse::<u64>().unwrap_or(u64::MAX));
             }
         }
         max_age
@@ -552,8 +570,11 @@ impl JwksResponse {
 /// Like [`fetch_jwks`] but also returns `Cache-Control` and `ETag` so callers
 /// can cache the key set.
 ///
-/// The library does no caching itself: cap or choose TTLs yourself, and do not
-/// cache error responses. This relies on the [`HttpClient`] filling
+/// The library does no caching itself. Take lifetimes from
+/// [`JwksResponse::cache_ttl_secs`], which is capped at
+/// [`MAX_JWKS_CACHE_TTL_SECS`], and bound any default you pick when it returns
+/// `None`: an unbounded cache stops key rotation and revocation from taking
+/// effect. Do not cache error responses. This relies on the [`HttpClient`] filling
 /// [`HttpFetchResponse::headers`]; without it both fields are `None`.
 pub async fn fetch_jwks_response(
     http: &Arc<dyn HttpClient>,
@@ -1823,6 +1844,34 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn jwks_ttl_is_capped_but_advertised_is_not() {
+        // A year-long max-age is capped to the ceiling.
+        let r = jwks_response_with_age("max-age=31536000", None).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(31_536_000));
+        assert_eq!(r.cache_ttl_secs(), Some(MAX_JWKS_CACHE_TTL_SECS));
+        // The cap applies after subtracting Age.
+        let r = jwks_response_with_age("max-age=31536000", Some("100")).await;
+        assert_eq!(r.cache_ttl_secs(), Some(MAX_JWKS_CACHE_TTL_SECS));
+        let r = jwks_response_with_age("max-age=100000", Some("99000")).await;
+        assert_eq!(r.cache_ttl_secs(), Some(1000));
+        // Values below the ceiling are untouched.
+        let r = jwks_response_with_age("max-age=600", None).await;
+        assert_eq!(r.cache_ttl_secs(), Some(600));
+        // An overflowing max-age saturates, then is capped, instead of
+        // being ignored and left to the caller's default.
+        let r =
+            jwks_response_with_age("max-age=340282366920938463463374607431768211455", None).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(u64::MAX));
+        assert_eq!(r.cache_ttl_secs(), Some(MAX_JWKS_CACHE_TTL_SECS));
+        // A caller-chosen ceiling is honoured; zero stays zero.
+        let r = jwks_response_with_age("max-age=3600", None).await;
+        assert_eq!(r.cache_ttl_secs_max(60), Some(60));
+        assert_eq!(r.cache_ttl_secs_max(0), Some(0));
+        let r = jwks_response_with_age("no-store", None).await;
+        assert_eq!(r.cache_ttl_secs(), Some(0));
     }
 
     #[tokio::test]
