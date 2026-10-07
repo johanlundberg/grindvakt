@@ -22,6 +22,7 @@
   returns an error, so existing clients keep compiling. Implement it to
   enable GET requests to UserInfo.
 - **Breaking:** `Error` is now `#[non_exhaustive]` and has a new `UpstreamHttp` variant (`Error::upstream_http()`). It carries the upstream status, the OAuth `error` / `error_description` (from the JSON body or the `WWW-Authenticate` header), and a sanitized body (control and bidi characters escaped, length capped). Non-success responses from the token, UserInfo, JWKS and discovery endpoints now return this variant instead of `Authn`/`Internal`. Their `Display` text is unchanged, but code that matched `Error::Authn(_)` or `Error::Internal(_)` for these failures must match `Error::UpstreamHttp(_)`. `status_hint` returns 502 for them.
+- UserInfo can now be fetched over GET (`UserinfoMethod::Get`, which needs `HttpClient::get_with_headers`) or POST through `rp::fetch_userinfo_response`. It returns the raw response so callers can verify signed `application/jwt` UserInfo themselves; encrypted responses are not supported. `rp::userinfo_json_claims` parses JSON responses and binds them to the expected subject. `rp::fetch_userinfo` keeps its signature and behaviour (POST, JSON).
 
 ## 0.8.2 [2026-09-28]
 

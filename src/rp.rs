@@ -618,32 +618,67 @@ pub fn verify_id_token(
     Ok(claims)
 }
 
-/// Fetch UserInfo with a Bearer access token for an associated issuer.
+/// How [`fetch_userinfo_response`] sends the UserInfo request (OIDC Core §5.3.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UserinfoMethod {
+    /// `POST` with an empty form body (the default).
+    #[default]
+    Post,
+    /// `GET`. Requires [`HttpClient::get_with_headers`].
+    Get,
+}
+
+/// Fetch UserInfo with a Bearer access token and return the raw 200 response.
 ///
-/// The issuer context is mandatory because the loopback HTTP development
-/// exception applies only when the issuer itself is a loopback HTTP origin.
-pub async fn fetch_userinfo(
+/// Validates the issuer and endpoint exactly as [`fetch_userinfo`] does, sends
+/// the request with `method`, and returns the response unchanged. Use this for
+/// signed `application/jwt` UserInfo: the caller verifies the JWS (and, per
+/// OIDC Core §5.3.2, `iss` and `aud`) and must compare `sub` itself. For JSON
+/// responses use [`userinfo_json_claims`]. Encrypted (JWE) responses are not
+/// supported.
+pub async fn fetch_userinfo_response(
     http: &Arc<dyn HttpClient>,
     userinfo_endpoint: &str,
     access_token: &str,
-    expected_sub: &str,
     issuer: &str,
-) -> Result<serde_json::Value> {
+    method: UserinfoMethod,
+) -> Result<HttpFetchResponse> {
     validate_issuer(issuer)?;
     validate_service_endpoint_for_issuer("userinfo_endpoint", userinfo_endpoint, issuer)?;
-    // The injected client has no per-request header API on GET, so userinfo is
-    // fetched via post_form with an empty body carrying the Authorization
-    // header. (Most OPs accept GET or POST at userinfo.)
     let headers = vec![(
         "authorization".to_string(),
         format!("Bearer {access_token}"),
     )];
-    let resp = http.post_form(userinfo_endpoint, &[], &headers).await?;
+    let resp = match method {
+        UserinfoMethod::Post => http.post_form(userinfo_endpoint, &[], &headers).await?,
+        UserinfoMethod::Get => http.get_with_headers(userinfo_endpoint, &headers).await?,
+    };
     if resp.status != 200 {
         return Err(upstream_error(
             format!("authentication error: userinfo returned {}", resp.status),
             &resp,
         ));
+    }
+    Ok(resp)
+}
+
+/// Parse a JSON UserInfo response and bind it to the id_token subject.
+///
+/// Rejects `application/jwt` (signed UserInfo); verify those yourself using
+/// [`fetch_userinfo_response`]. Other or missing content types are parsed as
+/// JSON.
+pub fn userinfo_json_claims(
+    resp: &HttpFetchResponse,
+    expected_sub: &str,
+) -> Result<serde_json::Value> {
+    let content_type = resp.content_type.as_deref().or(resp.header("content-type"));
+    if let Some(ct) = content_type {
+        let media_type = ct.split(';').next().unwrap_or("").trim();
+        if media_type.eq_ignore_ascii_case("application/jwt") {
+            return Err(Error::Authn(
+                "userinfo is a signed JWT (application/jwt); use rp::fetch_userinfo_response and verify it yourself".into(),
+            ));
+        }
     }
     let claims: serde_json::Value = resp.json()?;
     if claims.get("sub").and_then(|value| value.as_str()) != Some(expected_sub) {
@@ -652,6 +687,31 @@ pub async fn fetch_userinfo(
         ));
     }
     Ok(claims)
+}
+
+/// Fetch UserInfo with a Bearer access token for an associated issuer.
+///
+/// The issuer context is mandatory because the loopback HTTP development
+/// exception applies only when the issuer itself is a loopback HTTP origin.
+/// Uses POST and expects a JSON response. For GET, or for signed
+/// `application/jwt` UserInfo, use [`fetch_userinfo_response`] with
+/// [`userinfo_json_claims`].
+pub async fn fetch_userinfo(
+    http: &Arc<dyn HttpClient>,
+    userinfo_endpoint: &str,
+    access_token: &str,
+    expected_sub: &str,
+    issuer: &str,
+) -> Result<serde_json::Value> {
+    let resp = fetch_userinfo_response(
+        http,
+        userinfo_endpoint,
+        access_token,
+        issuer,
+        UserinfoMethod::Post,
+    )
+    .await?;
+    userinfo_json_claims(&resp, expected_sub)
 }
 
 /// Build a `private_key_jwt` client assertion (RFC 7523) for token-endpoint auth.
@@ -1252,6 +1312,163 @@ mod tests {
             "authentication error: userinfo returned 401"
         );
         assert_eq!(err.status_hint(), 502);
+    }
+
+    type RecordedCall = (String, String, Vec<(String, String)>);
+
+    /// Records every call as `(method, url, headers)`.
+    struct RecordingHttp {
+        calls: std::sync::Mutex<Vec<RecordedCall>>,
+        resp: crate::http::HttpFetchResponse,
+        get_supported: bool,
+    }
+
+    impl RecordingHttp {
+        fn new(resp: crate::http::HttpFetchResponse, get_supported: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Default::default(),
+                resp,
+                get_supported,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for RecordingHttp {
+        async fn get(&self, _url: &str) -> Result<crate::http::HttpFetchResponse> {
+            Err(Error::Internal("unexpected GET".into()))
+        }
+
+        async fn post_form(
+            &self,
+            url: &str,
+            _form: &[(String, String)],
+            headers: &[(String, String)],
+        ) -> Result<crate::http::HttpFetchResponse> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("POST".into(), url.into(), headers.to_vec()));
+            Ok(self.resp.clone())
+        }
+
+        async fn get_with_headers(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+        ) -> Result<crate::http::HttpFetchResponse> {
+            if !self.get_supported {
+                return Err(Error::Config("no get_with_headers".into()));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("GET".into(), url.into(), headers.to_vec()));
+            Ok(self.resp.clone())
+        }
+    }
+
+    fn json_userinfo(content_type: &str) -> crate::http::HttpFetchResponse {
+        crate::http::HttpFetchResponse {
+            status: 200,
+            body: br#"{"sub":"s1","name":"A"}"#.to_vec(),
+            content_type: Some(content_type.into()),
+            ..Default::default()
+        }
+    }
+
+    const UI_URL: &str = "https://op.example.org/userinfo";
+    const UI_ISS: &str = "https://op.example.org";
+
+    #[tokio::test]
+    async fn userinfo_get_sends_bearer_without_post() {
+        let rec = RecordingHttp::new(json_userinfo("application/json"), true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        let resp = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Get)
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "GET");
+        assert_eq!(calls[0].1, UI_URL);
+        assert_eq!(
+            calls[0].2,
+            vec![("authorization".to_string(), "Bearer at".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn userinfo_get_without_client_support_errors() {
+        let rec = RecordingHttp::new(json_userinfo("application/json"), false);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        let res = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Get).await;
+        assert!(res.is_err());
+        assert!(rec.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn userinfo_post_matches_fetch_userinfo() {
+        let rec = RecordingHttp::new(json_userinfo("application/json"), true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        let claims = fetch_userinfo(&http, UI_URL, "at", "s1", UI_ISS)
+            .await
+            .unwrap();
+        assert_eq!(claims["name"], "A");
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "POST");
+        assert_eq!(
+            calls[0].2,
+            vec![("authorization".to_string(), "Bearer at".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn userinfo_raw_jwt_returned_untouched_but_rejected_as_json() {
+        let jwt_resp = crate::http::HttpFetchResponse {
+            status: 200,
+            body: b"a.b.c".to_vec(),
+            content_type: Some("Application/JWT; charset=utf-8".into()),
+            ..Default::default()
+        };
+        let rec = RecordingHttp::new(jwt_resp, true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        let resp = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
+            .await
+            .unwrap();
+        assert_eq!(resp.body, b"a.b.c");
+        let err = userinfo_json_claims(&resp, "s1").unwrap_err();
+        assert!(err.to_string().contains("fetch_userinfo_response"), "{err}");
+        assert!(fetch_userinfo(&http, UI_URL, "at", "s1", UI_ISS)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn userinfo_json_claims_accepts_charset_and_binds_sub() {
+        let resp = json_userinfo("application/json; charset=utf-8");
+        assert_eq!(userinfo_json_claims(&resp, "s1").unwrap()["sub"], "s1");
+        let err = userinfo_json_claims(&resp, "other").unwrap_err();
+        assert!(err.to_string().contains("userinfo sub does not match"));
+    }
+
+    #[tokio::test]
+    async fn userinfo_loopback_endpoint_under_remote_issuer_rejected_before_http() {
+        let rec = RecordingHttp::new(json_userinfo("application/json"), true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        for method in [UserinfoMethod::Get, UserinfoMethod::Post] {
+            let res = fetch_userinfo_response(
+                &http,
+                "http://127.0.0.1:8080/userinfo",
+                "at",
+                UI_ISS,
+                method,
+            )
+            .await;
+            assert!(res.is_err());
+        }
+        assert!(rec.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
