@@ -21,6 +21,7 @@
 - `HttpClient` gains `get_with_headers`, with a default implementation that
   returns an error, so existing clients keep compiling. Implement it to
   enable GET requests to UserInfo.
+- **Breaking:** `Error` is now `#[non_exhaustive]` and has a new `UpstreamHttp` variant (`Error::upstream_http()`). It carries the upstream status, the OAuth `error` / `error_description` (from the JSON body or the `WWW-Authenticate` header), and a sanitized body (control and bidi characters escaped, length capped). Non-success responses from the token, UserInfo, JWKS and discovery endpoints now return this variant instead of `Authn`/`Internal`. Their `Display` text is unchanged, but code that matched `Error::Authn(_)` or `Error::Internal(_)` for these failures must match `Error::UpstreamHttp(_)`. `status_hint` returns 502 for them.
 
 ## 0.8.2 [2026-09-28]
 

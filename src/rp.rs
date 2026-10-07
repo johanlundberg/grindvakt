@@ -3,8 +3,10 @@
 //! Runtime-agnostic: outbound HTTP goes through the injected
 //! [`crate::HttpClient`].
 
-use crate::error::{Error, Result};
-use crate::http::HttpClient;
+use crate::error::{
+    escape_upstream_text, parse_www_authenticate_bearer, Error, Result, UpstreamHttpError,
+};
+use crate::http::{HttpClient, HttpFetchResponse};
 use crate::jwt;
 use crate::keys::SigningKey;
 use crate::metadata::ProviderMetadata;
@@ -276,10 +278,13 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
     let url = format!("{discovery_prefix}/.well-known/openid-configuration");
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!(
-            "discovery failed ({}) for {url}",
-            resp.status
-        )));
+        return Err(upstream_error(
+            format!(
+                "internal error: discovery failed ({}) for {url}",
+                resp.status
+            ),
+            &resp,
+        ));
     }
     let metadata: ProviderMetadata = resp.json()?;
     if metadata.issuer != requested_issuer {
@@ -460,10 +465,10 @@ pub async fn fetch_jwks(
     validate_service_endpoint_for_issuer("jwks_uri", jwks_uri, issuer)?;
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
-        return Err(Error::Internal(format!(
-            "jwks fetch failed ({})",
-            resp.status
-        )));
+        return Err(upstream_error(
+            format!("internal error: jwks fetch failed ({})", resp.status),
+            &resp,
+        ));
     }
     JwkSet::from_json(&resp.text()).map_err(Error::from)
 }
@@ -505,11 +510,14 @@ pub async fn exchange_code(
         .post_form(&provider.token_endpoint, &form, &headers)
         .await?;
     if resp.status != 200 {
-        return Err(Error::Authn(format!(
-            "token endpoint returned {}: {}",
-            resp.status,
-            sanitize_error_body(&resp.text())
-        )));
+        return Err(upstream_error(
+            format!(
+                "authentication error: token endpoint returned {}: {}",
+                resp.status,
+                sanitize_error_body(&resp.text())
+            ),
+            &resp,
+        ));
     }
     let raw: serde_json::Value = resp.json()?;
     let access_token = raw
@@ -632,7 +640,10 @@ pub async fn fetch_userinfo(
     )];
     let resp = http.post_form(userinfo_endpoint, &[], &headers).await?;
     if resp.status != 200 {
-        return Err(Error::Authn(format!("userinfo returned {}", resp.status)));
+        return Err(upstream_error(
+            format!("authentication error: userinfo returned {}", resp.status),
+            &resp,
+        ));
     }
     let claims: serde_json::Value = resp.json()?;
     if claims.get("sub").and_then(|value| value.as_str()) != Some(expected_sub) {
@@ -660,6 +671,51 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
 /// error: control characters are stripped (log/terminal injection) and the
 /// text is truncated to 512 chars so a hostile or broken OP cannot blow up our
 /// logs or responses.
+/// Build a structured [`Error::UpstreamHttp`] from a non-success response.
+///
+/// `error` / `error_description` come from a JSON object body with a string
+/// `error` (RFC 6749 §5.2); otherwise from the `WWW-Authenticate` header.
+/// `message` is the full `Display` text.
+fn upstream_error(message: String, resp: &HttpFetchResponse) -> Error {
+    let mut error = None;
+    let mut description = None;
+    if let Ok(serde_json::Value::Object(obj)) =
+        serde_json::from_slice::<serde_json::Value>(&resp.body)
+    {
+        if let Some(code) = obj.get("error").and_then(|v| v.as_str()) {
+            error = Some(escape_upstream_text(code, 64));
+            description = obj
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .map(|d| escape_upstream_text(d, 256));
+        }
+    }
+    if error.is_none() {
+        if let Some((e, d)) = resp
+            .header("www-authenticate")
+            .and_then(parse_www_authenticate_bearer)
+        {
+            error = e.map(|e| escape_upstream_text(&e, 64));
+            description = d.map(|d| escape_upstream_text(&d, 256));
+        }
+    }
+    let body = if resp.body.is_empty() {
+        None
+    } else {
+        Some(escape_upstream_text(
+            &String::from_utf8_lossy(&resp.body),
+            512,
+        ))
+    };
+    Error::UpstreamHttp(Box::new(UpstreamHttpError::new(
+        Some(resp.status),
+        error,
+        description,
+        body,
+        message,
+    )))
+}
+
 fn sanitize_error_body(body: &str) -> String {
     body.chars().filter(|c| !c.is_control()).take(512).collect()
 }
@@ -1108,6 +1164,122 @@ mod tests {
             !msg.chars().any(|c| c.is_control()),
             "control characters must be stripped: {msg:?}"
         );
+    }
+
+    fn mock_post(resp: crate::http::HttpFetchResponse) -> Arc<dyn HttpClient> {
+        Arc::new(MockHttp {
+            get: None,
+            post: Some(resp),
+        })
+    }
+
+    #[tokio::test]
+    async fn token_error_is_structured_and_escaped() {
+        let (client, provider, _key) = client_and_provider();
+        let body = r#"{"error":"invalid_grant","error_description":"bad\u001b[31m code"}"#;
+        let http = mock_post(crate::http::HttpFetchResponse::new(400, body));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        let up = err.upstream_http().expect("upstream variant");
+        assert_eq!(up.status, Some(400));
+        assert_eq!(up.error.as_deref(), Some("invalid_grant"));
+        let d = up.error_description.as_deref().unwrap();
+        assert!(d.contains("\\u{1b}"), "{d}");
+        assert!(!d.chars().any(|c| c.is_control()));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "authentication error: token endpoint returned 400: {}",
+                sanitize_error_body(body)
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "authentication error: token endpoint returned 400: {\"error\":\"invalid_grant\",\"error_description\":\"bad\\u001b[31m code\"}"
+        );
+        assert_eq!(err.status_hint(), 502);
+    }
+
+    #[tokio::test]
+    async fn token_error_body_field_is_capped_and_bidi_escaped() {
+        let (client, provider, _key) = client_and_provider();
+        let body = format!("oops\x1b[31m\n{}\u{202E}", "x".repeat(2000));
+        let http = mock_post(crate::http::HttpFetchResponse::new(400, body.clone()));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        let up = err.upstream_http().unwrap();
+        let b = up.body.as_deref().unwrap();
+        assert!(!b.chars().any(|c| c.is_control()));
+        assert!(b.chars().count() <= 513);
+        assert!(b.ends_with('…'));
+        assert_eq!(up.error, None);
+
+        let http = mock_post(crate::http::HttpFetchResponse::new(400, "a\u{202E}b"));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.upstream_http().unwrap().body.as_deref(),
+            Some("a\\u{202e}b")
+        );
+    }
+
+    #[tokio::test]
+    async fn userinfo_error_parses_www_authenticate() {
+        let resp = crate::http::HttpFetchResponse::new(401, "").with_header(
+            "WWW-Authenticate",
+            r#"Bearer error="invalid_token", error_description="expired""#,
+        );
+        let http = mock_post(resp);
+        let err = fetch_userinfo(
+            &http,
+            "https://op.example.org/userinfo",
+            "tok",
+            "sub",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        let up = err.upstream_http().unwrap();
+        assert_eq!(up.status, Some(401));
+        assert_eq!(up.error.as_deref(), Some("invalid_token"));
+        assert_eq!(up.error_description.as_deref(), Some("expired"));
+        assert_eq!(up.body, None);
+        assert_eq!(
+            err.to_string(),
+            "authentication error: userinfo returned 401"
+        );
+        assert_eq!(err.status_hint(), 502);
+    }
+
+    #[tokio::test]
+    async fn discover_and_jwks_failures_are_upstream_http() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(404, "nope")),
+            post: None,
+        });
+        let err = discover(&http, "https://op.example.com").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "internal error: discovery failed (404) for https://op.example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(err.upstream_http().unwrap().status, Some(404));
+
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(500, "")),
+            post: None,
+        });
+        let err = fetch_jwks(
+            &http,
+            "https://op.example.org/jwks",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "internal error: jwks fetch failed (500)");
+        assert_eq!(err.upstream_http().unwrap().body, None);
     }
 
     #[test]
