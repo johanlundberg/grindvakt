@@ -88,6 +88,9 @@ impl AuthorizationRequest {
         let redirect_uri = get("redirect_uri")
             .ok_or_else(|| OAuthError::invalid_request("missing redirect_uri"))?;
         let scope = get("scope").unwrap_or_default();
+        if get("state").is_some_and(|state| !crate::oauth_error::is_valid_state(&state)) {
+            return Err(OAuthError::invalid_request("invalid state parameter"));
+        }
 
         let claims = match get("claims") {
             Some(s) => Some(
@@ -298,6 +301,36 @@ mod tests {
         assert!(!req.wants_id_token());
         assert_eq!(req.extra.get("custom").map(|s| s.as_str()), Some("v"));
         req.validate_response_type().unwrap();
+    }
+
+    #[test]
+    fn hostile_state_is_rejected_at_parse() {
+        let with_state = |state: &str| {
+            params(&[
+                ("client_id", "c1"),
+                ("response_type", "code"),
+                ("redirect_uri", "https://rp/cb"),
+                ("state", state),
+            ])
+        };
+        // Ordinary and maximum-length printable-ASCII states are accepted.
+        for ok in ["xyz", "a b~!", "", &"s".repeat(1024)] {
+            let req = AuthorizationRequest::from_params(&with_state(ok)).unwrap();
+            assert_eq!(req.state.as_deref(), Some(ok));
+        }
+        // Too long, bidi, line separators, controls and non-ASCII are refused.
+        for bad in [
+            "s".repeat(1025),
+            "st\u{202E}ate".to_string(),
+            "a\u{2028}b".to_string(),
+            "a\u{2029}b".to_string(),
+            "a\nb".to_string(),
+            "a\u{e5}b".to_string(),
+        ] {
+            let err = AuthorizationRequest::from_params(&with_state(&bad)).unwrap_err();
+            assert_eq!(err.state, None, "{bad:?}");
+            assert!(err.to_string().contains("invalid state parameter"));
+        }
     }
 
     #[test]

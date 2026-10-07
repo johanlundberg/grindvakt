@@ -375,6 +375,15 @@ impl Provider {
         if !client.allows_redirect(&req.redirect_uri) {
             return Err(OAuthError::invalid_request("redirect_uri not registered"));
         }
+        // `state` is echoed on every response; the request may have been built
+        // directly rather than parsed, so enforce the same bound here.
+        if req
+            .state
+            .as_deref()
+            .is_some_and(|state| !crate::oauth_error::is_valid_state(state))
+        {
+            return Err(OAuthError::invalid_request("invalid state parameter"));
+        }
         // Exact registration matching is necessary but not sufficient: a
         // malformed value can itself have been registered. Parse it before it
         // can reach a Location header, while retaining absolute custom-scheme

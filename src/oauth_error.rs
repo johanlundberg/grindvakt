@@ -74,6 +74,19 @@ pub(crate) fn wire_description(description: &str) -> String {
         .collect()
 }
 
+/// Longest `state` value accepted or echoed, in characters. RFC 6749 sets no
+/// limit; this bounds the `Location` header and JSON body an unauthenticated
+/// request can make the OP produce.
+pub(crate) const MAX_STATE_CHARS: usize = 1024;
+
+/// Whether `state` can be accepted and echoed: at most [`MAX_STATE_CHARS`]
+/// characters, all from the RFC 6749 §A.5 `VSCHAR` set (`%x20-7E`). This
+/// excludes controls, bidi and line-separator characters, and non-ASCII text.
+pub(crate) fn is_valid_state(state: &str) -> bool {
+    state.chars().count() <= MAX_STATE_CHARS
+        && state.chars().all(|c| matches!(c, '\u{20}'..='\u{7E}'))
+}
+
 /// An OAuth2 error with an optional human-readable description.
 ///
 /// `description` holds the raw text. It is normalized to the RFC 6749
@@ -117,6 +130,12 @@ impl OAuthError {
         self
     }
 
+    /// The `state` to echo: omitted when it could not have been accepted
+    /// ([`is_valid_state`]), so a hostile value never reaches the wire.
+    fn wire_state(&self) -> Option<&str> {
+        self.state.as_deref().filter(|s| is_valid_state(s))
+    }
+
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self::new(OAuthErrorCode::InvalidRequest, msg)
     }
@@ -135,7 +154,7 @@ impl OAuthError {
         let body = ErrorBody {
             error: self.code.as_str(),
             error_description: self.description.as_deref().map(wire_description),
-            state: self.state.as_deref(),
+            state: self.wire_state(),
         };
         let json = serde_json::to_vec(&body).unwrap_or_default();
         let mut r = Response::new(self.code.http_status())
@@ -157,7 +176,7 @@ impl OAuthError {
         if let Some(desc) = description.as_deref() {
             params.push(("error_description", desc));
         }
-        if let Some(state) = self.state.as_deref() {
+        if let Some(state) = self.wire_state() {
             params.push(("state", state));
         }
         let encoded = params
@@ -219,6 +238,43 @@ mod tests {
         assert_eq!(dirty, "a?b?c??d?e?f");
         // Clean text is unchanged.
         assert_eq!(wire_description("bad request: x=1"), "bad request: x=1");
+    }
+
+    #[test]
+    fn wire_responses_omit_states_that_could_not_have_been_accepted() {
+        let hostile = [
+            format!("st\u{202E}ate{}", "x".repeat(4000)),
+            "a\u{2028}b\u{2029}c".to_string(),
+            "s".repeat(MAX_STATE_CHARS + 1),
+            "a\nb".to_string(),
+        ];
+        for state in hostile {
+            let err = OAuthError::invalid_request("d").with_state(Some(state.clone()));
+            let body = err.to_response().body;
+            let text = String::from_utf8(body.clone()).unwrap();
+            assert!(!text.contains("state"), "{text}");
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json.get("state").is_none());
+            for fragment in [false, true] {
+                let resp = err.to_redirect("https://rp.example/cb", fragment);
+                let loc = resp
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n == "location")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap();
+                assert!(!loc.contains("state="), "{loc}");
+                assert!(loc.len() < 512, "{}", loc.len());
+            }
+        }
+        // A valid state is echoed unchanged.
+        let ok = OAuthError::invalid_request("d").with_state(Some("a b~!".into()));
+        let json: serde_json::Value = serde_json::from_slice(&ok.to_response().body).unwrap();
+        assert_eq!(json["state"], "a b~!");
+        let max = "s".repeat(MAX_STATE_CHARS);
+        let ok = OAuthError::invalid_request("d").with_state(Some(max.clone()));
+        let json: serde_json::Value = serde_json::from_slice(&ok.to_response().body).unwrap();
+        assert_eq!(json["state"], max.as_str());
     }
 
     #[test]
