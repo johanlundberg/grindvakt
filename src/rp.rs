@@ -599,6 +599,11 @@ pub fn verify_id_token(
 /// `auth_time` checks when [`IdTokenOptions::leeway`] is `None`.
 const DEFAULT_LEEWAY: u64 = 60;
 
+/// Largest accepted [`IdTokenOptions::leeway`] (seconds). Skew tolerance is
+/// meant to absorb clock drift, not to revive expired id_tokens; larger values
+/// are rejected as a configuration error.
+pub const MAX_ID_TOKEN_LEEWAY: u64 = 300;
+
 /// Extra id_token checks for [`verify_id_token_with`].
 ///
 /// The struct is `#[non_exhaustive]`: construct it with [`IdTokenOptions::new`]
@@ -606,9 +611,13 @@ const DEFAULT_LEEWAY: u64 = 60;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct IdTokenOptions<'a> {
-    /// Clock-skew tolerance (seconds) for exp/nbf/iat and auth_time. None = jose-rs default (60s).
+    /// Clock-skew tolerance (seconds) for exp/nbf/iat and the future-`auth_time`
+    /// check. None = jose-rs default (60s). Values above
+    /// [`MAX_ID_TOKEN_LEEWAY`] are rejected with `Error::BadRequest`. It is not
+    /// added to `max_age`.
     pub leeway: Option<u64>,
-    /// OIDC max_age: requires numeric `auth_time` with now <= auth_time + max_age + leeway.
+    /// OIDC max_age: requires numeric `auth_time` with now <= auth_time + max_age.
+    /// Clock-skew leeway is deliberately not added to the session age.
     pub max_age: Option<u64>,
     /// If set, `acr` must be present (string) and in this list. Empty list = configuration error (Error::BadRequest).
     pub acr_values: Option<&'a [&'a str]>,
@@ -632,7 +641,7 @@ impl<'a> IdTokenOptions<'a> {
         Self::default()
     }
 
-    /// Set the clock-skew tolerance in seconds.
+    /// Set the clock-skew tolerance in seconds (at most [`MAX_ID_TOKEN_LEEWAY`]).
     pub fn with_leeway(mut self, seconds: u64) -> Self {
         self.leeway = Some(seconds);
         self
@@ -719,6 +728,11 @@ pub fn verify_id_token_with(
             "require_c_hash needs an authorization_code to check against".into(),
         ));
     }
+    if options.leeway.is_some_and(|l| l > MAX_ID_TOKEN_LEEWAY) {
+        return Err(Error::BadRequest(format!(
+            "id_token leeway must be at most {MAX_ID_TOKEN_LEEWAY} seconds"
+        )));
+    }
     if options.acr_values.is_some_and(<[&str]>::is_empty) {
         return Err(Error::BadRequest(
             "acr_values must not be empty when set".into(),
@@ -784,7 +798,8 @@ pub fn verify_id_token_with(
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| Error::Authn("id_token missing auth_time required by max_age".into()))?;
         let now = now_secs();
-        if now > auth_time.saturating_add(max_age).saturating_add(leeway) {
+        // Skew tolerance is not added to max_age: it is a session-age policy.
+        if now > auth_time.saturating_add(max_age) {
             return Err(Error::Authn(
                 "id_token auth_time is older than max_age".into(),
             ));
@@ -1906,6 +1921,60 @@ mod tests {
         .unwrap();
         assert!(verify_with(&jwks, &token, es, &IdTokenOptions::new().with_leeway(0)).is_err());
         verify_with(&jwks, &token, es, &IdTokenOptions::new().with_leeway(60)).unwrap();
+    }
+
+    #[test]
+    fn id_token_options_leeway_is_bounded_and_not_added_to_max_age() {
+        let (_c, _p, key) = client_and_provider();
+        let es = JwsAlgorithm::ES256;
+        let now = now_secs();
+
+        // A leeway above the cap is a configuration error, even for a valid token.
+        let (token, jwks) = opts_token(&key, |_| {});
+        let err = verify_with(
+            &jwks,
+            &token,
+            es,
+            &IdTokenOptions::new().with_leeway(MAX_ID_TOKEN_LEEWAY + 1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+        assert!(verify_with(
+            &jwks,
+            &token,
+            es,
+            &IdTokenOptions::new().with_leeway(u64::MAX)
+        )
+        .is_err());
+        verify_with(
+            &jwks,
+            &token,
+            es,
+            &IdTokenOptions::new().with_leeway(MAX_ID_TOKEN_LEEWAY),
+        )
+        .unwrap();
+
+        // An expired token is not revived by a huge leeway.
+        let (token, jwks) = opts_token(&key, |c| c.exp = Some(now - 86_400 * 365));
+        assert!(verify_with(
+            &jwks,
+            &token,
+            es,
+            &IdTokenOptions::new().with_leeway(u64::MAX)
+        )
+        .is_err());
+
+        // Leeway does not stretch max_age: 100s old with max_age 60 fails
+        // even with the maximum leeway.
+        let (token, jwks) = opts_token(&key, |c| {
+            c.extra.insert("auth_time".into(), (now - 100).into());
+        });
+        let opts = IdTokenOptions::new()
+            .with_max_age(60)
+            .with_leeway(MAX_ID_TOKEN_LEEWAY);
+        assert!(verify_with(&jwks, &token, es, &opts).is_err());
+        let opts = IdTokenOptions::new().with_max_age(120);
+        verify_with(&jwks, &token, es, &opts).unwrap();
     }
 
     #[test]
