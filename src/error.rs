@@ -107,8 +107,14 @@ impl std::fmt::Display for UpstreamHttpError {
     }
 }
 
-fn is_bidi_format(c: char) -> bool {
+pub(crate) fn is_bidi_format(c: char) -> bool {
     matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Make an attacker-controlled value safe to interpolate into an error
+/// message: escapes control and bidi formatting characters and caps length.
+pub(crate) fn display_safe(s: &str) -> String {
+    escape_upstream_text(s, 256)
 }
 
 /// Escape control and bidi/format characters in untrusted upstream text and

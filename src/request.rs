@@ -1,5 +1,6 @@
 //! Parsing and validation of OIDC authorization requests.
 
+use crate::error::display_safe;
 use crate::oauth_error::{OAuthError, OAuthErrorCode};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,7 +68,8 @@ impl AuthorizationRequest {
             }
             if unique.insert(name.clone(), value.clone()).is_some() {
                 return Err(OAuthError::invalid_request(format!(
-                    "duplicate authorization parameter: {name}"
+                    "duplicate authorization parameter: {}",
+                    display_safe(name)
                 )));
             }
         }
@@ -230,7 +232,10 @@ impl AuthorizationRequest {
         if !supported {
             return Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedResponseType,
-                format!("unsupported response_type: {}", self.response_type),
+                format!(
+                    "unsupported response_type: {}",
+                    display_safe(&self.response_type)
+                ),
             )
             .with_state(self.state.clone()));
         }
@@ -259,7 +264,8 @@ impl AuthorizationRequest {
             )
             .with_state(self.state.clone())),
             Some(other) => Err(OAuthError::invalid_request(format!(
-                "unsupported response_mode: {other}"
+                "unsupported response_mode: {}",
+                display_safe(other)
             ))
             .with_state(self.state.clone())),
         }
@@ -488,5 +494,28 @@ mod tests {
             assert_eq!(err.code, OAuthErrorCode::InvalidRequest, "prompt={prompt}");
             assert_eq!(err.state.as_deref(), Some("state-1"));
         }
+    }
+
+    #[test]
+    fn error_messages_escape_bidi_characters() {
+        let text = AuthorizationRequest::from_pairs(&[
+            ("client_id".to_string(), "c1".to_string()),
+            ("a\u{202E}".to_string(), "1".to_string()),
+            ("a\u{202E}".to_string(), "2".to_string()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+
+        let p = params(&[
+            ("client_id", "c1"),
+            ("response_type", "co\u{202E}de"),
+            ("redirect_uri", "https://rp/cb"),
+        ]);
+        let req = AuthorizationRequest::from_params(&p).unwrap();
+        let text = req.validate_response_type().unwrap_err().to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
     }
 }

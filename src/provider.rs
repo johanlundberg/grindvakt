@@ -9,6 +9,7 @@ use crate::client::{
     Client, ClientStore, AUTH_CLIENT_SECRET_BASIC, AUTH_CLIENT_SECRET_POST, AUTH_NONE,
     AUTH_PRIVATE_KEY_JWT,
 };
+use crate::error::display_safe;
 use crate::jwt;
 use crate::keys::SigningKey;
 use crate::mac::sha256;
@@ -755,7 +756,7 @@ impl Provider {
             }
             other => Err(OAuthError::new(
                 OAuthErrorCode::UnsupportedGrantType,
-                format!("unsupported grant_type: {other}"),
+                format!("unsupported grant_type: {}", display_safe(other)),
             )),
         }
     }
@@ -1532,7 +1533,8 @@ fn unique_parameters(params: &[(String, String)]) -> Result<BTreeMap<String, Str
     for (name, value) in params {
         if unique.insert(name.clone(), value.clone()).is_some() {
             return Err(OAuthError::invalid_request(format!(
-                "duplicate token parameter: {name}"
+                "duplicate token parameter: {}",
+                display_safe(name)
             )));
         }
     }
@@ -1991,5 +1993,44 @@ mod tests {
             *ttl <= DEFAULT_CLIENT_ASSERTION_MAX_AGE + Validation::new().leeway,
             "jti TTL ({ttl}) must be capped at max_age + leeway, not run to exp"
         );
+    }
+
+    #[tokio::test]
+    async fn client_supplied_grant_type_and_parameter_names_are_escaped() {
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let key = crate::keys::signing_key_from_jwk_json(
+            &jwk.to_json().unwrap(),
+            Some("ES256"),
+            Some("op-key"),
+        )
+        .unwrap();
+        let op = Provider::new(
+            ProviderMetadata::new("https://op.example.com", "https://op.example.com"),
+            key,
+            Arc::new(crate::client::InMemoryClientStore::with_clients(vec![])),
+            TokenCodec::new("op-secret"),
+            TokenLifetimes::default(),
+            Arc::new(RecordingStore::default()),
+        )
+        .expect("asymmetric OP signing key");
+
+        let mut form = BTreeMap::new();
+        form.insert("grant_type".to_string(), "x\u{202E}y".to_string());
+        let err = op
+            .handle_token_request_map(&form, None, "https://op.example.com/token", None)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+
+        let params = vec![
+            ("a\u{202E}".to_string(), "1".to_string()),
+            ("a\u{202E}".to_string(), "2".to_string()),
+        ];
+        let text = unique_parameters(&params).unwrap_err().to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
     }
 }

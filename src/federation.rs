@@ -5,7 +5,7 @@
 //! Signing/verification all go through `jose-rs`; outbound fetches go through the
 //! injected [`crate::HttpClient`].
 
-use crate::error::{Error, Result};
+use crate::error::{display_safe, Error, Result};
 use crate::http::HttpClient;
 use crate::keys::SigningKey;
 use crate::util::now_secs;
@@ -181,7 +181,8 @@ pub async fn fetch_entity_configuration(
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
-            "entity config fetch {url} returned {}",
+            "entity config fetch {} returned {}",
+            display_safe(&url),
             resp.status
         )));
     }
@@ -222,12 +223,14 @@ async fn resolve_one(
     let self_issued = verify_self_signed(&ec_jwt)?;
     if ec.iss() != Some(ta_id) || ec.sub() != Some(ta_id) {
         return Err(Error::Authn(format!(
-            "trust anchor {ta_id} entity configuration is not issued for the configured entity id"
+            "trust anchor {} entity configuration is not issued for the configured entity id",
+            display_safe(ta_id)
         )));
     }
     if self_issued.iss() != Some(ta_id) || self_issued.sub() != Some(ta_id) {
         return Err(Error::Authn(format!(
-            "trust anchor {ta_id} entity configuration is not self-issued"
+            "trust anchor {} entity configuration is not self-issued",
+            display_safe(ta_id)
         )));
     }
 
@@ -238,7 +241,8 @@ async fn resolve_one(
         .and_then(|v| v.as_str().map(String::from))
         .ok_or_else(|| {
             Error::Internal(format!(
-                "trust anchor {ta_id} has no federation_resolve_endpoint"
+                "trust anchor {} has no federation_resolve_endpoint",
+                display_safe(ta_id)
             ))
         })?;
 
@@ -253,8 +257,9 @@ async fn resolve_one(
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Authn(format!(
-            "resolve endpoint returned {} for {sub}",
-            resp.status
+            "resolve endpoint returned {} for {}",
+            resp.status,
+            display_safe(sub)
         )));
     }
 
@@ -457,7 +462,8 @@ pub async fn fetch_signed_jwks(
     if let Some(content_type) = resp.content_type.as_deref() {
         if !content_type.starts_with("application/jwk-set+jwt") {
             return Err(Error::Authn(format!(
-                "signed_jwks_uri returned unexpected content type {content_type}"
+                "signed_jwks_uri returned unexpected content type {}",
+                display_safe(content_type)
             )));
         }
     }
@@ -525,7 +531,8 @@ pub async fn fetch_collection(
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(Error::Internal(format!(
-            "collection endpoint {url} returned {}",
+            "collection endpoint {} returned {}",
+            display_safe(&url),
             resp.status
         )));
     }
@@ -596,9 +603,12 @@ pub fn parse_collection(body: &Value, entity_type: &str) -> Vec<CollectionEntity
 /// `essential` operators.
 pub fn apply_policy(metadata: &mut Map<String, Value>, policy: &Map<String, Value>) -> Result<()> {
     for (param, ops) in policy {
-        let ops = ops
-            .as_object()
-            .ok_or_else(|| Error::BadRequest(format!("policy for {param} is not an object")))?;
+        let ops = ops.as_object().ok_or_else(|| {
+            Error::BadRequest(format!(
+                "policy for {} is not an object",
+                display_safe(param)
+            ))
+        })?;
 
         // value: force.
         if let Some(v) = ops.get("value") {
@@ -626,7 +636,8 @@ pub fn apply_policy(metadata: &mut Map<String, Value>, policy: &Map<String, Valu
             && !metadata.contains_key(param)
         {
             return Err(Error::Authn(format!(
-                "metadata policy requires essential parameter {param}"
+                "metadata policy requires essential parameter {}",
+                display_safe(param)
             )));
         }
         // one_of: scalar must be in the list.
@@ -634,7 +645,8 @@ pub fn apply_policy(metadata: &mut Map<String, Value>, policy: &Map<String, Valu
             if let Some(current) = metadata.get(param) {
                 if !allowed.contains(current) {
                     return Err(Error::Authn(format!(
-                        "metadata {param} not in one_of constraint"
+                        "metadata {} not in one_of constraint",
+                        display_safe(param)
                     )));
                 }
             }
@@ -645,7 +657,8 @@ pub fn apply_policy(metadata: &mut Map<String, Value>, policy: &Map<String, Valu
                 for v in &current {
                     if !allowed.contains(v) {
                         return Err(Error::Authn(format!(
-                            "metadata {param} violates subset_of constraint"
+                            "metadata {} violates subset_of constraint",
+                            display_safe(param)
                         )));
                     }
                 }
@@ -657,7 +670,8 @@ pub fn apply_policy(metadata: &mut Map<String, Value>, policy: &Map<String, Valu
             for v in &required {
                 if !current.contains(v) {
                     return Err(Error::Authn(format!(
-                        "metadata {param} violates superset_of constraint"
+                        "metadata {} violates superset_of constraint",
+                        display_safe(param)
                     )));
                 }
             }

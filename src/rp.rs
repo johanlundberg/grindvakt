@@ -4,7 +4,8 @@
 //! [`crate::HttpClient`].
 
 use crate::error::{
-    escape_upstream_text, parse_www_authenticate_bearer, Error, Result, UpstreamHttpError,
+    display_safe, escape_upstream_text, is_bidi_format, parse_www_authenticate_bearer, Error,
+    Result, UpstreamHttpError,
 };
 use crate::http::{HttpClient, HttpFetchResponse};
 use crate::jwt;
@@ -187,14 +188,16 @@ fn validate_authorization_extras(endpoint: &str, extra: &[(&str, &str)]) -> Resu
     for (name, _) in extra {
         if RESERVED.contains(name) {
             return Err(Error::BadRequest(format!(
-                "authorization extra parameter {name} is library-controlled"
+                "authorization extra parameter {} is library-controlled",
+                display_safe(name)
             )));
         }
         // RFC 8707 permits repeated resource parameters. Other extension
         // parameters must remain unambiguous.
         if *name != "resource" && !seen.insert((*name).to_string()) {
             return Err(Error::BadRequest(format!(
-                "duplicate authorization extra parameter: {name}"
+                "duplicate authorization extra parameter: {}",
+                display_safe(name)
             )));
         }
     }
@@ -289,8 +292,9 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
     let metadata: ProviderMetadata = resp.json()?;
     if metadata.issuer != requested_issuer {
         return Err(Error::Authn(format!(
-            "discovered issuer {} does not match requested issuer {requested_issuer}",
-            metadata.issuer
+            "discovered issuer {} does not match requested issuer {}",
+            display_safe(&metadata.issuer),
+            display_safe(requested_issuer)
         )));
     }
     ProviderInfo::from(metadata.clone()).validate()?;
@@ -314,16 +318,19 @@ fn validate_endpoint(name: &str, endpoint: &str, allow_loopback_http: bool) -> R
     // The URL parser discards some raw whitespace and control characters.
     // Reject them first because callers send or return the original string,
     // and validation must describe the same bytes that reach the sink.
-    if endpoint
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
+    if endpoint.chars().any(|character| {
+        character.is_whitespace() || character.is_control() || is_bidi_format(character)
+    }) {
         return Err(Error::BadRequest(format!(
-            "{name} must not contain whitespace or control characters"
+            "{name} must not contain whitespace, control or bidi formatting characters"
         )));
     }
-    let parsed = url::Url::parse(endpoint)
-        .map_err(|e| Error::BadRequest(format!("invalid {name} URL {endpoint}: {e}")))?;
+    let parsed = url::Url::parse(endpoint).map_err(|e| {
+        Error::BadRequest(format!(
+            "invalid {name} URL {}: {e}",
+            display_safe(endpoint)
+        ))
+    })?;
     let scheme_ok = parsed.scheme() == "https"
         || (allow_loopback_http
             && parsed.scheme() == "http"
@@ -335,17 +342,20 @@ fn validate_endpoint(name: &str, endpoint: &str, allow_loopback_http: bool) -> R
             "an absolute https URL"
         };
         return Err(Error::BadRequest(format!(
-            "{name} must be {policy}: {endpoint}"
+            "{name} must be {policy}: {}",
+            display_safe(endpoint)
         )));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(Error::BadRequest(format!(
-            "{name} must not contain userinfo: {endpoint}"
+            "{name} must not contain userinfo: {}",
+            display_safe(endpoint)
         )));
     }
     if parsed.fragment().is_some() {
         return Err(Error::BadRequest(format!(
-            "{name} must not contain a fragment: {endpoint}"
+            "{name} must not contain a fragment: {}",
+            display_safe(endpoint)
         )));
     }
     Ok(())
@@ -361,10 +371,9 @@ pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
 }
 
 fn issuer_allows_loopback_http(issuer: &str) -> bool {
-    if issuer
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
+    if issuer.chars().any(|character| {
+        character.is_whitespace() || character.is_control() || is_bidi_format(character)
+    }) {
         return false;
     }
     url::Url::parse(issuer).is_ok_and(|parsed| {
@@ -407,7 +416,8 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
     for (name, _) in parsed.query_pairs() {
         if RESERVED.contains(&name.as_ref()) {
             return Err(Error::BadRequest(format!(
-                "authorization_endpoint query parameter {name} is library-controlled"
+                "authorization_endpoint query parameter {} is library-controlled",
+                display_safe(&name)
             )));
         }
         if name != "resource" && !seen.insert(name.into_owned()) {
@@ -426,8 +436,9 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
 /// fragment.
 pub fn validate_issuer(issuer: &str) -> Result<()> {
     validate_endpoint("issuer", issuer, true)?;
-    let parsed = url::Url::parse(issuer)
-        .map_err(|e| Error::BadRequest(format!("invalid issuer URL {issuer}: {e}")))?;
+    let parsed = url::Url::parse(issuer).map_err(|e| {
+        Error::BadRequest(format!("invalid issuer URL {}: {e}", display_safe(issuer)))
+    })?;
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(Error::BadRequest(
             "issuer URL must not contain a query or fragment".into(),
@@ -442,8 +453,12 @@ pub fn validate_issuer(issuer: &str) -> Result<()> {
 /// fragment. The scheme is not checked, so custom/native-app schemes such as
 /// `com.example.app:/cb` are accepted.
 pub fn validate_redirect_uri(redirect_uri: &str) -> Result<()> {
-    let parsed = url::Url::parse(redirect_uri)
-        .map_err(|e| Error::BadRequest(format!("invalid redirect_uri {redirect_uri}: {e}")))?;
+    let parsed = url::Url::parse(redirect_uri).map_err(|e| {
+        Error::BadRequest(format!(
+            "invalid redirect_uri {}: {e}",
+            display_safe(redirect_uri)
+        ))
+    })?;
     if parsed.fragment().is_some() {
         return Err(Error::BadRequest(
             "redirect_uri must not contain a fragment".into(),
@@ -542,7 +557,8 @@ pub async fn exchange_code(
     // section 7.1 forbids using a token type the client does not understand.
     if !token_type.eq_ignore_ascii_case("Bearer") {
         return Err(Error::Authn(format!(
-            "unsupported token_type in token response: {token_type}"
+            "unsupported token_type in token response: {}",
+            display_safe(&token_type)
         )));
     }
     Ok(TokenSet {
@@ -734,7 +750,8 @@ pub fn verify_id_token_with(
                     .any(|trusted| audience == trusted)
             {
                 return Err(Error::Authn(format!(
-                    "id_token contains untrusted audience: {audience}"
+                    "id_token contains untrusted audience: {}",
+                    display_safe(audience)
                 )));
             }
         }
@@ -938,10 +955,6 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
     jwt::sign(key, &c, None)
 }
 
-/// Sanitize an upstream token-endpoint error body before embedding it in our
-/// error: control characters are stripped (log/terminal injection) and the
-/// text is truncated to 512 chars so a hostile or broken OP cannot blow up our
-/// logs or responses.
 /// Build a structured [`Error::UpstreamHttp`] from a non-success response.
 ///
 /// `error` / `error_description` come from a JSON object body with a string
@@ -987,8 +1000,15 @@ fn upstream_error(message: String, resp: &HttpFetchResponse) -> Error {
     )))
 }
 
+/// Sanitize an upstream token-endpoint error body before embedding it in our
+/// error: control and bidi/format characters are stripped (log/terminal
+/// injection) and the text is truncated to 512 chars so a hostile or broken OP
+/// cannot blow up our logs or responses.
 fn sanitize_error_body(body: &str) -> String {
-    body.chars().filter(|c| !c.is_control()).take(512).collect()
+    body.chars()
+        .filter(|c| !c.is_control() && !crate::error::is_bidi_format(*c))
+        .take(512)
+        .collect()
 }
 
 fn apply_client_auth(
@@ -1494,6 +1514,13 @@ mod tests {
         assert_eq!(
             err.upstream_http().unwrap().body.as_deref(),
             Some("a\\u{202e}b")
+        );
+        // The Display text must not carry the bidi override either.
+        let shown = err.to_string();
+        assert!(!shown.contains('\u{202E}'));
+        assert_eq!(
+            shown,
+            "authentication error: token endpoint returned 400: ab"
         );
     }
 
@@ -2143,5 +2170,85 @@ mod tests {
         assert!(validate_issuer("http://localhost:8080").is_ok());
         assert!(validate_redirect_uri("https://rp.example/cb#frag").is_err());
         assert!(validate_redirect_uri("com.example.app:/cb").is_ok());
+    }
+
+    #[tokio::test]
+    async fn discover_issuer_mismatch_escapes_bidi_characters() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response("https://evil.example.com/\u{202E}x")),
+            post: None,
+        });
+        let text = discover(&http, "https://op.example.com")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_token_type_escapes_bidi_characters() {
+        let (client, provider, _key) = client_and_provider();
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: None,
+            post: Some(crate::http::HttpFetchResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "access_token": "a",
+                    "id_token": "i",
+                    "token_type": "x\u{202E}y",
+                })
+                .to_string()
+                .into_bytes(),
+                content_type: Some("application/json".into()),
+                ..Default::default()
+            }),
+        });
+        let text = exchange_code(&http, &provider, &client, "code-1", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+    }
+
+    #[test]
+    fn untrusted_audience_escapes_bidi_characters() {
+        let (_client, _provider, key) = client_and_provider();
+        let jwks = key.to_public_jwks();
+        let now = now_secs();
+        let claims = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Multiple(vec![
+                "https://rp.example.com".into(),
+                "evil\u{202E}".into(),
+            ])),
+            iat: Some(now),
+            exp: Some(now + 300),
+            ..Default::default()
+        };
+        let token = jwt::sign(&key, &claims, None).unwrap();
+        let text = verify_id_token(
+            &jwks,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[JwsAlgorithm::ES256],
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(text.contains("\\u{202e}"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_bidi_formatting_characters() {
+        let err = validate_issuer("https://op.example.com/\u{202E}x").unwrap_err();
+        assert!(err.to_string().contains("bidi"), "{err}");
+        assert!(validate_service_endpoint("jwks_uri", "https://op.example.com/\u{200F}").is_err());
+        assert!(!issuer_allows_loopback_http("http://localhost/\u{202E}"));
     }
 }
