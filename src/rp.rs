@@ -546,6 +546,19 @@ pub async fn exchange_code(
         ));
     }
     let raw: serde_json::Value = resp.json()?;
+    // A broken OP can answer 200 with an RFC 6749 §5.2 error body.
+    if raw.get("error").is_some_and(serde_json::Value::is_string)
+        && raw.get("access_token").is_none()
+    {
+        return Err(upstream_error(
+            format!(
+                "authentication error: token endpoint returned an error with status {}",
+                resp.status
+            ),
+            &resp,
+            true,
+        ));
+    }
     let access_token = raw
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -965,6 +978,20 @@ pub async fn fetch_userinfo_response(
             &resp,
             true,
         ));
+    }
+    // A broken OP can answer 200 with an RFC 6750 style JSON error body. A real
+    // UserInfo response carries `sub`; signed responses are not JSON objects.
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(&resp.body) {
+        if obj.get("error").is_some_and(serde_json::Value::is_string) && !obj.contains_key("sub") {
+            return Err(upstream_error(
+                format!(
+                    "authentication error: userinfo returned an error with status {}",
+                    resp.status
+                ),
+                &resp,
+                true,
+            ));
+        }
     }
     Ok(resp)
 }
@@ -1543,6 +1570,38 @@ mod tests {
             get: None,
             post: Some(resp),
         })
+    }
+
+    #[tokio::test]
+    async fn json_error_bodies_on_200_are_structured_errors() {
+        let (client, provider, _key) = client_and_provider();
+        let body = r#"{"error":"invalid_grant","error_description":"code expired"}"#;
+        let http = mock_post(crate::http::HttpFetchResponse::new(200, body));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        let up = err.upstream_http().expect("structured");
+        assert_eq!(up.status, Some(200));
+        assert_eq!(up.error.as_deref(), Some("invalid_grant"));
+        assert_eq!(up.error_description.as_deref(), Some("code expired"));
+        assert!(err.is_auth_failure());
+
+        let ui = r#"{"error":"invalid_token","error_description":"expired"}"#;
+        let http = mock_post(crate::http::HttpFetchResponse::new(200, ui));
+        let err = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.upstream_http().unwrap().error.as_deref(),
+            Some("invalid_token")
+        );
+
+        // A real UserInfo response that also happens to carry `sub` is untouched.
+        let ok = r#"{"sub":"s1","error":"not-an-error-claim"}"#;
+        let http = mock_post(crate::http::HttpFetchResponse::new(200, ok));
+        fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
