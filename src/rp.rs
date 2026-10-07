@@ -977,9 +977,29 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 /// not `application/jwt`; use [`userinfo_json_claims`] for JSON. Encrypted
 /// (JWE) responses are not supported.
 ///
-/// `exp` is checked only if present. OIDC Core §5.3.2 does not require `exp`
-/// in signed UserInfo, so requiring it is opt-in: pass `require_exp = true` if
-/// your OP emits it, and tokens without `exp` are then rejected.
+/// # Context confusion and replay
+///
+/// OPs commonly sign UserInfo with the same key that signs id_tokens, and the
+/// `iss`, `aud` and `sub` of both are identical. An id_token (or any other
+/// token the OP signed for this client) could therefore be replayed as a
+/// UserInfo response. Three defences apply:
+///
+/// - **Age bound.** By default the token must carry `iat` and be no older than
+///   [`UserinfoJwtOptions::max_age`] (300 seconds, plus the 60 second default
+///   clock-skew leeway), so a captured token cannot be replayed indefinitely
+///   even if it has no `exp`. [`UserinfoJwtOptions::without_max_age`] removes
+///   the bound; use it only for OPs that emit neither `iat` nor `exp`, and
+///   accept that replay is then unbounded.
+/// - **`typ`.** [`UserinfoJwtOptions::with_typ`] requires an exact JOSE `typ`
+///   header (RFC 8725 §3.11), for OPs that type their UserInfo JWTs.
+/// - **id_token markers are refused.** After verification, a token whose
+///   claims contain `nonce`, `at_hash` or `c_hash`, or whose `typ` header is
+///   `id_token+jwt` or `at+jwt` (case-insensitive), is rejected as an id_token
+///   or access token presented as UserInfo.
+///
+/// `exp` is checked only if present, unless
+/// [`UserinfoJwtOptions::require_exp`] is set: OIDC Core §5.3.2 does not
+/// require `exp` in signed UserInfo.
 pub fn userinfo_signed_claims(
     jwks: &JwkSet,
     resp: &HttpFetchResponse,
@@ -987,7 +1007,7 @@ pub fn userinfo_signed_claims(
     client_id: &str,
     expected_sub: &str,
     allowed_algorithms: &[JwsAlgorithm],
-    require_exp: bool,
+    options: &UserinfoJwtOptions<'_>,
 ) -> Result<serde_json::Value> {
     if allowed_algorithms.is_empty() {
         return Err(Error::BadRequest(
@@ -1012,16 +1032,100 @@ pub fn userinfo_signed_claims(
         .with_issuer(issuer)
         .with_audience(client_id)
         .with_allowed_algorithms(allowed_algorithms.to_vec());
-    if require_exp {
+    if options.require_exp {
         validation = validation.require_exp();
     }
-    let claims = jwt::verify_with_jwks(jwks, token.trim(), &validation)?;
+    if let Some(max_age) = options.max_age {
+        validation = validation.with_max_age(max_age);
+    }
+    if let Some(typ) = options.typ {
+        validation = validation.with_typ(typ);
+    }
+    let token = token.trim();
+    let claims = jwt::verify_with_jwks(jwks, token, &validation)?;
     if claims.sub.as_deref() != Some(expected_sub) {
         return Err(Error::Authn(
             "userinfo sub does not match the validated id_token subject".into(),
         ));
     }
+    let typ_is_token = jwt::peek_header(token)?.typ.as_deref().is_some_and(|t| {
+        t.eq_ignore_ascii_case("id_token+jwt") || t.eq_ignore_ascii_case("at+jwt")
+    });
+    let has_id_token_claim = ["nonce", "at_hash", "c_hash"]
+        .iter()
+        .any(|k| claims.extra.contains_key(*k));
+    if typ_is_token || has_id_token_claim {
+        return Err(Error::Authn(
+            "signed userinfo carries id_token claims (nonce/at_hash/c_hash); refusing to treat an id_token as UserInfo".into(),
+        ));
+    }
     Ok(serde_json::to_value(&claims)?)
+}
+
+/// Default [`UserinfoJwtOptions::max_age`] in seconds.
+pub const DEFAULT_USERINFO_JWT_MAX_AGE: u64 = 300;
+
+/// Extra checks for [`userinfo_signed_claims`].
+///
+/// The struct is `#[non_exhaustive]`: construct it with
+/// [`UserinfoJwtOptions::new`] (or `default()`) and the `with_*` builders.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct UserinfoJwtOptions<'a> {
+    /// Require `exp`. Default false (OIDC Core §5.3.2 does not require it).
+    pub require_exp: bool,
+    /// Maximum age of the token measured from `iat` (seconds). Default
+    /// `Some(300)`. `iat` is then required. `None` disables the age bound
+    /// ("allow undated"): only for OPs that emit neither `iat` nor `exp`, and
+    /// then replay is unbounded.
+    pub max_age: Option<u64>,
+    /// Required JOSE `typ` header (RFC 8725 §3.11), e.g. an OP-specific value.
+    /// Default `None`.
+    pub typ: Option<&'a str>,
+}
+
+impl Default for UserinfoJwtOptions<'_> {
+    fn default() -> Self {
+        Self {
+            require_exp: false,
+            max_age: Some(DEFAULT_USERINFO_JWT_MAX_AGE),
+            typ: None,
+        }
+    }
+}
+
+impl<'a> UserinfoJwtOptions<'a> {
+    /// Defaults: `exp` optional, token age bounded to 300 seconds from `iat`,
+    /// no `typ` requirement.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reject tokens without `exp`.
+    pub fn with_require_exp(mut self) -> Self {
+        self.require_exp = true;
+        self
+    }
+
+    /// Require `iat` and a token age of at most `seconds`.
+    pub fn with_max_age(mut self, seconds: u64) -> Self {
+        self.max_age = Some(seconds);
+        self
+    }
+
+    /// Remove the age bound and the `iat` requirement. Replay is then
+    /// unbounded unless the token has `exp`; use only for OPs that emit
+    /// neither `iat` nor `exp`.
+    pub fn without_max_age(mut self) -> Self {
+        self.max_age = None;
+        self
+    }
+
+    /// Require this JOSE `typ` header value.
+    pub fn with_typ(mut self, typ: &'a str) -> Self {
+        self.typ = Some(typ);
+        self
+    }
 }
 
 /// How [`fetch_userinfo_response`] sends the UserInfo request (OIDC Core §5.3.1).
@@ -2069,21 +2173,19 @@ mod tests {
     fn userinfo_signed_claims_verifies_and_binds() {
         let (_c, _p, key) = client_and_provider();
         let es = [JwsAlgorithm::ES256];
+        let o = UserinfoJwtOptions::new();
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
 
         let (resp, jwks) = signed_userinfo(&key, |_| {});
-        let v = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &es, false).unwrap();
+        let v = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &es, &o).unwrap();
         assert_eq!(v["sub"], "subject");
 
         // Wrong subject, issuer and audience are rejected.
-        assert!(userinfo_signed_claims(&jwks, &resp, iss, aud, "other", &es, false).is_err());
+        assert!(userinfo_signed_claims(&jwks, &resp, iss, aud, "other", &es, &o).is_err());
         assert!(
-            userinfo_signed_claims(&jwks, &resp, "https://evil", aud, "subject", &es, false)
-                .is_err()
+            userinfo_signed_claims(&jwks, &resp, "https://evil", aud, "subject", &es, &o).is_err()
         );
-        assert!(
-            userinfo_signed_claims(&jwks, &resp, iss, "other-rp", "subject", &es, false).is_err()
-        );
+        assert!(userinfo_signed_claims(&jwks, &resp, iss, "other-rp", "subject", &es, &o).is_err());
 
         // A signature from a different key is rejected.
         let (_, _, other) = client_and_provider();
@@ -2094,7 +2196,7 @@ mod tests {
             aud,
             "subject",
             &es,
-            false
+            &o
         )
         .is_err());
 
@@ -2106,36 +2208,129 @@ mod tests {
             aud,
             "subject",
             &[JwsAlgorithm::RS256],
-            false
+            &o
         )
         .is_err());
-        let err =
-            userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[], false).unwrap_err();
+        let err = userinfo_signed_claims(&jwks, &resp, iss, aud, "subject", &[], &o).unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
 
         // A JSON-typed response is not accepted as signed userinfo.
         let json = json_userinfo("application/json");
-        assert!(userinfo_signed_claims(&jwks, &json, iss, aud, "s1", &es, false).is_err());
+        assert!(userinfo_signed_claims(&jwks, &json, iss, aud, "s1", &es, &o).is_err());
 
         // A tampered token fails verification.
         let mut bad = resp.clone();
         let n = bad.body.len();
         bad.body[n - 3] = if bad.body[n - 3] == b'A' { b'B' } else { b'A' };
-        assert!(userinfo_signed_claims(&jwks, &bad, iss, aud, "subject", &es, false).is_err());
+        assert!(userinfo_signed_claims(&jwks, &bad, iss, aud, "subject", &es, &o).is_err());
     }
 
     #[test]
     fn userinfo_signed_claims_require_exp_is_opt_in() {
         let (_c, _p, key) = client_and_provider();
         let es = [JwsAlgorithm::ES256];
+        let o = UserinfoJwtOptions::new();
+        let req = UserinfoJwtOptions::new().with_require_exp();
         let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
 
         let (no_exp, jwks) = signed_userinfo(&key, |c| c.exp = None);
-        userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, false).unwrap();
-        assert!(userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, true).is_err());
+        userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, &o).unwrap();
+        assert!(userinfo_signed_claims(&jwks, &no_exp, iss, aud, "subject", &es, &req).is_err());
 
         let (with_exp, jwks) = signed_userinfo(&key, |_| {});
-        userinfo_signed_claims(&jwks, &with_exp, iss, aud, "subject", &es, true).unwrap();
+        userinfo_signed_claims(&jwks, &with_exp, iss, aud, "subject", &es, &req).unwrap();
+    }
+
+    fn signed_userinfo_typ(
+        key: &SigningKey,
+        typ: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (crate::http::HttpFetchResponse, JwkSet) {
+        let now = now_secs();
+        let mut c = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Single("https://rp.example.com".into())),
+            iat: Some(now),
+            ..Default::default()
+        };
+        for (k, v) in extra {
+            c.extra.insert((*k).into(), serde_json::json!(v));
+        }
+        let token = jwt::sign(key, &c, typ).unwrap();
+        let resp = crate::http::HttpFetchResponse::new(200, token)
+            .with_header("Content-Type", "application/jwt");
+        (resp, key.to_public_jwks())
+    }
+
+    #[test]
+    fn userinfo_signed_claims_rejects_id_token_claims_and_typ() {
+        let (_c, _p, key) = client_and_provider();
+        let es = [JwsAlgorithm::ES256];
+        let o = UserinfoJwtOptions::new();
+        let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
+        let run =
+            |resp: &crate::http::HttpFetchResponse, jwks: &JwkSet, o: &UserinfoJwtOptions<'_>| {
+                userinfo_signed_claims(jwks, resp, iss, aud, "subject", &es, o)
+            };
+
+        let (ok, jwks) = signed_userinfo_typ(&key, None, &[("name", "A")]);
+        assert_eq!(run(&ok, &jwks, &o).unwrap()["name"], "A");
+
+        for claim in ["nonce", "at_hash", "c_hash"] {
+            let (resp, jwks) = signed_userinfo_typ(&key, None, &[(claim, "x")]);
+            let err = run(&resp, &jwks, &o).unwrap_err();
+            assert!(err.to_string().contains("id_token"), "{claim}: {err}");
+        }
+        for typ in ["id_token+jwt", "ID_Token+JWT", "at+jwt"] {
+            let (resp, jwks) = signed_userinfo_typ(&key, Some(typ), &[]);
+            assert!(run(&resp, &jwks, &o).is_err(), "{typ}");
+        }
+
+        // with_typ requires an exact header match.
+        let want = UserinfoJwtOptions::new().with_typ("userinfo+jwt");
+        let (typed, jwks) = signed_userinfo_typ(&key, Some("userinfo+jwt"), &[]);
+        run(&typed, &jwks, &want).unwrap();
+        let (untyped, jwks) = signed_userinfo_typ(&key, None, &[]);
+        assert!(run(&untyped, &jwks, &want).is_err());
+        run(&untyped, &jwks, &o).unwrap();
+    }
+
+    #[test]
+    fn userinfo_signed_claims_age_bound() {
+        let (_c, _p, key) = client_and_provider();
+        let es = [JwsAlgorithm::ES256];
+        let o = UserinfoJwtOptions::new();
+        let undated = UserinfoJwtOptions::new().without_max_age();
+        let (iss, aud) = ("https://op.example.org", "https://rp.example.com");
+        let run =
+            |resp: &crate::http::HttpFetchResponse, jwks: &JwkSet, o: &UserinfoJwtOptions<'_>| {
+                userinfo_signed_claims(jwks, resp, iss, aud, "subject", &es, o)
+            };
+
+        // Old iat, no exp: rejected by default, accepted without the bound.
+        let (old, jwks) = signed_userinfo(&key, |c| {
+            c.iat = Some(now_secs() - 3600);
+            c.exp = None;
+        });
+        assert!(run(&old, &jwks, &o).is_err());
+        run(&old, &jwks, &undated).unwrap();
+
+        // Missing iat: rejected by default, accepted without the bound.
+        let (no_iat, jwks) = signed_userinfo(&key, |c| {
+            c.iat = None;
+            c.exp = None;
+        });
+        assert!(run(&no_iat, &jwks, &o).is_err());
+        run(&no_iat, &jwks, &undated).unwrap();
+
+        // A custom bound applies.
+        let (recent, jwks) = signed_userinfo(&key, |c| {
+            c.iat = Some(now_secs() - 200);
+            c.exp = None;
+        });
+        run(&recent, &jwks, &o).unwrap();
+        assert!(run(&recent, &jwks, &UserinfoJwtOptions::new().with_max_age(10)).is_err());
     }
 
     #[test]
