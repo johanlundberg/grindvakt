@@ -1006,7 +1006,9 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 ///   that type their UserInfo JWTs.
 /// - **[`UserinfoJwtOptions::dedicated_keys`]** (safe). The caller attests
 ///   that `jwks` holds only keys the OP uses to sign UserInfo responses, never
-///   id_tokens, so a token that verifies cannot be an id_token.
+///   id_tokens, so a token that verifies cannot be an id_token. It does not
+///   prove the token is UserInfo rather than another JWT signed by those keys;
+///   the audience must still be exactly the client.
 /// - **[`UserinfoJwtOptions::untyped_shared_key_compat`]** (compatibility
 ///   only). For OPs that sign UserInfo and id_tokens with the same keys and
 ///   set no `typ`. A fresh id_token without `nonce`, `at_hash` and `c_hash`
@@ -1021,6 +1023,9 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 ///   even if it has no `exp`. [`UserinfoJwtOptions::without_max_age`] removes
 ///   the bound; use it only for OPs that emit neither `iat` nor `exp`, and
 ///   accept that replay is then unbounded.
+/// - **The audience must be exactly `client_id`** (a string, or an array with
+///   that single element). Multi-audience and duplicated-audience tokens are
+///   refused in every mode, unlike `jose-rs`' membership check.
 /// - **id_token markers are refused.** After verification, a token whose
 ///   claims contain `nonce`, `at_hash` or `c_hash`, or whose `typ` header is
 ///   `id_token+jwt` or `at+jwt` (case-insensitive, with or without a leading
@@ -1084,6 +1089,20 @@ pub fn userinfo_signed_claims(
     }
     let token = token.trim();
     let claims = jwt::verify_with_jwks(jwks, token, &validation)?;
+    // OIDC Core §5.3.2: the audience of a signed UserInfo response is this
+    // client. jose-rs only checks membership, so a token addressed to several
+    // audiences (an API or service token with the same iss and sub) or one that
+    // repeats the client would pass; require exactly the client_id.
+    let audience_is_client = match claims.aud.as_ref() {
+        Some(Audience::Single(aud)) => aud == client_id,
+        Some(Audience::Multiple(values)) => values.len() == 1 && values[0] == client_id,
+        None => false,
+    };
+    if !audience_is_client {
+        return Err(Error::Authn(
+            "signed userinfo audience must be exactly the client_id".into(),
+        ));
+    }
     if claims.sub.as_deref() != Some(expected_sub) {
         return Err(Error::Authn(
             "userinfo sub does not match the validated id_token subject".into(),
@@ -2645,6 +2664,51 @@ mod tests {
         ] {
             let err = run_userinfo(&resp, &jwks, &UserinfoJwtOptions::typed(typ)).unwrap_err();
             assert!(matches!(err, Error::BadRequest(_)), "{typ:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn userinfo_audience_must_be_exactly_the_client() {
+        let (_c, _p, key) = client_and_provider();
+        let (iss, rp) = USERINFO_ISS_AUD;
+        let sign_aud = |aud: Audience| {
+            let c = Claims {
+                iss: Some(iss.into()),
+                sub: Some("subject".into()),
+                aud: Some(aud),
+                iat: Some(now_secs()),
+                ..Default::default()
+            };
+            let token = jwt::sign(&key, &c, Some("userinfo+jwt")).unwrap();
+            crate::http::HttpFetchResponse::new(200, token)
+                .with_header("Content-Type", "application/jwt")
+        };
+        let jwks = key.to_public_jwks();
+        let modes = [
+            UserinfoJwtOptions::typed("userinfo+jwt"),
+            UserinfoJwtOptions::dedicated_keys(),
+            UserinfoJwtOptions::untyped_shared_key_compat(),
+        ];
+        for o in &modes {
+            // Accepted: the client alone, as a string or a one-element array.
+            run_userinfo(&sign_aud(Audience::Single(rp.into())), &jwks, o).unwrap();
+            run_userinfo(&sign_aud(Audience::Multiple(vec![rp.into()])), &jwks, o).unwrap();
+            // Refused: another audience (rejected by jose-rs itself) ...
+            assert!(run_userinfo(
+                &sign_aud(Audience::Single("https://other-service.invalid".into())),
+                &jwks,
+                o
+            )
+            .is_err());
+            // ... and the client plus another, or duplicates (our check).
+            for aud in [
+                Audience::Multiple(vec![rp.into(), "https://other-service.invalid".into()]),
+                Audience::Multiple(vec!["https://other-service.invalid".into(), rp.into()]),
+                Audience::Multiple(vec![rp.into(), rp.into()]),
+            ] {
+                let err = run_userinfo(&sign_aud(aud), &jwks, o).unwrap_err();
+                assert!(matches!(err, Error::Authn(_)), "{err}");
+            }
         }
     }
 
