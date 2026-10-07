@@ -34,7 +34,9 @@ the crate:
   characters), length-capped, and redacted by `Debug`.
 - Other error messages that quote remote or client-supplied values escape
   control and bidi characters and cap each value at 256 characters, and
-  endpoint validation rejects bidi/format characters in the raw string.
+  endpoint validation rejects bidi characters and other invisible
+  formatting characters (zero-width characters, soft hyphen, BOM, fillers,
+  variation selectors, tag characters) in the raw string.
 
 ## Consequences
 

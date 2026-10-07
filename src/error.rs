@@ -158,11 +158,35 @@ impl std::fmt::Display for UpstreamHttpError {
     }
 }
 
-pub(crate) fn is_bidi_format(c: char) -> bool {
+/// Whether `c` is a bidirectional control, line/paragraph separator or other
+/// invisible formatting character: one that renders as nothing, or reorders
+/// or splits surrounding text, so it can make a URL or log line look like
+/// something it is not. `char::is_control` does not cover these (they are
+/// category Cf, not Cc). Hand-maintained from Unicode general category Cf and
+/// Default_Ignorable_Code_Point, without pulling in a Unicode crate.
+pub(crate) fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
+        // Bidirectional controls and Unicode line/paragraph separators.
         '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
             | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Zero-width and other invisible format characters (general
+            // category Cf and Default_Ignorable_Code_Point): soft hyphen,
+            // number-sign prefixes, Mongolian vowel separator, zero-width
+            // space/joiners, word joiner and invisible operators, deprecated
+            // formatting, BOM, interlinear annotation, and similar.
+            | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+            | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
+            | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+            // Invisible fillers and variation selectors.
+            | '\u{034F}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+            | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+            // Tag characters, invisible and able to carry hidden data.
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
@@ -178,7 +202,7 @@ pub(crate) fn escape_upstream_text(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut count = 0usize;
     for c in s.chars() {
-        let piece: String = if c.is_control() || is_bidi_format(c) {
+        let piece: String = if c.is_control() || is_invisible_format(c) {
             c.escape_unicode().to_string()
         } else {
             c.to_string()
@@ -418,6 +442,36 @@ mod tests {
         assert_eq!(escape_upstream_text("a\u{61c}b", 64), "a\\u{61c}b");
         assert_eq!(escape_upstream_text("a\u{2028}b", 64), "a\\u{2028}b");
         assert_eq!(escape_upstream_text("a\u{2029}b", 64), "a\\u{2029}b");
+    }
+
+    #[test]
+    fn invisible_format_characters_are_escaped_and_ordinary_text_is_not() {
+        for c in [
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{2060}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{034F}',
+            '\u{180E}',
+            '\u{FE0F}',
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{206A}',
+        ] {
+            let escaped = escape_upstream_text(&format!("a{c}b"), 64);
+            assert!(!escaped.contains(c), "{c:?} not escaped: {escaped}");
+            assert!(escaped.contains("\\u{"), "{c:?}: {escaped}");
+        }
+        // Ordinary text, including non-ASCII letters, digits and an emoji, is kept.
+        assert_eq!(
+            escape_upstream_text("åäö ü 日本語 ✓ 😀", 64),
+            "åäö ü 日本語 ✓ 😀"
+        );
     }
 
     #[test]

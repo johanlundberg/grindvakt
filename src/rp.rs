@@ -4,7 +4,7 @@
 //! [`crate::HttpClient`].
 
 use crate::error::{
-    display_safe, escape_upstream_text, is_bidi_format, parse_www_authenticate_bearer,
+    display_safe, escape_upstream_text, is_invisible_format, parse_www_authenticate_bearer,
     quotes_balanced, split_unquoted_commas, Error, Result, UpstreamHttpError,
 };
 use crate::http::{HttpClient, HttpFetchResponse};
@@ -317,10 +317,10 @@ fn validate_endpoint(name: &str, endpoint: &str, allow_loopback_http: bool) -> R
     // Reject them first because callers send or return the original string,
     // and validation must describe the same bytes that reach the sink.
     if endpoint.chars().any(|character| {
-        character.is_whitespace() || character.is_control() || is_bidi_format(character)
+        character.is_whitespace() || character.is_control() || is_invisible_format(character)
     }) {
         return Err(Error::BadRequest(format!(
-            "{name} must not contain whitespace, control or bidi formatting characters"
+            "{name} must not contain whitespace, control, bidi or invisible formatting characters"
         )));
     }
     let parsed = url::Url::parse(endpoint).map_err(|e| {
@@ -370,7 +370,7 @@ pub fn validate_service_endpoint(name: &str, endpoint: &str) -> Result<()> {
 
 fn issuer_allows_loopback_http(issuer: &str) -> bool {
     if issuer.chars().any(|character| {
-        character.is_whitespace() || character.is_control() || is_bidi_format(character)
+        character.is_whitespace() || character.is_control() || is_invisible_format(character)
     }) {
         return false;
     }
@@ -432,8 +432,9 @@ fn validate_authorization_endpoint_query(endpoint: &str) -> Result<()> {
 /// Validate an issuer identifier.
 ///
 /// It must be an absolute `https` URL (`http` is accepted only for loopback
-/// hosts) with no whitespace or control characters, userinfo, query or
-/// fragment. It checks syntax only: it does not establish that the issuer is
+/// hosts) with no whitespace, control, bidi or invisible formatting
+/// characters (zero-width characters, soft hyphen, BOM and similar, which make
+/// look-alike URLs), userinfo, query or fragment. It checks syntax only: it does not establish that the issuer is
 /// trusted or that discovery metadata matches it.
 pub fn validate_issuer(issuer: &str) -> Result<()> {
     validate_endpoint("issuer", issuer, true)?;
@@ -3545,7 +3546,31 @@ mod tests {
         assert!(err.to_string().contains("bidi"), "{err}");
         assert!(validate_service_endpoint("jwks_uri", "https://op.example.com/\u{200F}").is_err());
         assert!(!issuer_allows_loopback_http("http://localhost/\u{202E}"));
-        for c in ['\u{061C}', '\u{2028}', '\u{2029}'] {
+        for c in [
+            '\u{061C}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{200B}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{3164}',
+            '\u{E0001}',
+            '\u{FE0F}',
+        ] {
+            // In the path, and in the host (the look-alike issuer case).
+            for issuer in [
+                format!("https://op.example.com/{c}x"),
+                format!("https://op.example.com{c}.evil.invalid"),
+                format!("https://{c}op.example.com"),
+                format!("https://op.exa{c}mple.com"),
+            ] {
+                assert!(validate_issuer(&issuer).is_err(), "{c:?} {issuer:?}");
+                assert!(
+                    validate_service_endpoint("jwks_uri", &issuer).is_err(),
+                    "{c:?} {issuer:?}"
+                );
+                assert!(!issuer_allows_loopback_http(&issuer));
+            }
             let issuer = format!("https://op.example.com/{c}x");
             assert!(validate_issuer(&issuer).is_err(), "{c:?}");
             assert!(
