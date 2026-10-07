@@ -579,7 +579,9 @@ pub async fn fetch_jwks_response(
             .header("age")
             .map(str::trim)
             .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|v| v.parse::<u64>().ok()),
+            // A digits-only value too large for u64 means "very old": saturate
+            // so no freshness remains, instead of reading it as no Age at all.
+            .map(|v| v.parse::<u64>().unwrap_or(u64::MAX)),
     })
 }
 
@@ -1797,6 +1799,15 @@ mod tests {
         // Age beyond the lifetime saturates at zero, no underflow.
         let r = jwks_response_with_age("max-age=60", Some("99999")).await;
         assert_eq!(r.cache_ttl_secs(), Some(0));
+        // A digits-only Age that overflows u64 saturates: nothing stays fresh.
+        for age in ["18446744073709551616", "99999999999999999999999999"] {
+            let r = jwks_response_with_age("max-age=300", Some(age)).await;
+            assert_eq!(r.age, Some(u64::MAX), "{age}");
+            assert_eq!(r.cache_ttl_secs(), Some(0), "{age}");
+            assert_eq!(r.advertised_ttl_secs(), Some(300));
+        }
+        let r = jwks_response_with_age("max-age=300", Some("18446744073709551615")).await;
+        assert_eq!(r.age, Some(u64::MAX));
         // Missing or invalid Age is treated as 0.
         for age in [None, Some("abc"), Some("-5"), Some("")] {
             let r = jwks_response_with_age("max-age=300", age).await;
