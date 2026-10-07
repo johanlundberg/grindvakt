@@ -1023,7 +1023,8 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 ///   accept that replay is then unbounded.
 /// - **id_token markers are refused.** After verification, a token whose
 ///   claims contain `nonce`, `at_hash` or `c_hash`, or whose `typ` header is
-///   `id_token+jwt` or `at+jwt` (case-insensitive), is rejected as an id_token
+///   `id_token+jwt` or `at+jwt` (case-insensitive, with or without a leading
+///   `application/`), is rejected as an id_token
 ///   or access token presented as UserInfo.
 ///
 /// The safe path is therefore [`UserinfoJwtOptions::typed`] or
@@ -1071,11 +1072,10 @@ pub fn userinfo_signed_claims(
         validation = validation.with_max_age(max_age);
     }
     if let UserinfoTrust::Typed(typ) = options.trust {
-        if typ.is_empty()
-            || ["jwt", "id_token+jwt", "at+jwt"]
-                .iter()
-                .any(|generic| typ.eq_ignore_ascii_case(generic))
-        {
+        if matches!(
+            normalized_typ(typ).as_str(),
+            "" | "jwt" | "id_token+jwt" | "at+jwt"
+        ) {
             return Err(Error::BadRequest(
                 "typ must identify UserInfo specifically".into(),
             ));
@@ -1089,9 +1089,10 @@ pub fn userinfo_signed_claims(
             "userinfo sub does not match the validated id_token subject".into(),
         ));
     }
-    let typ_is_token = jwt::peek_header(token)?.typ.as_deref().is_some_and(|t| {
-        t.eq_ignore_ascii_case("id_token+jwt") || t.eq_ignore_ascii_case("at+jwt")
-    });
+    let typ_is_token = jwt::peek_header(token)?
+        .typ
+        .as_deref()
+        .is_some_and(|t| matches!(normalized_typ(t).as_str(), "id_token+jwt" | "at+jwt"));
     let has_id_token_claim = ["nonce", "at_hash", "c_hash"]
         .iter()
         .any(|k| claims.extra.contains_key(*k));
@@ -1101,6 +1102,19 @@ pub fn userinfo_signed_claims(
         ));
     }
     Ok(serde_json::to_value(&claims)?)
+}
+
+/// Normalize a JOSE `typ` value for comparison: case-insensitive, with any
+/// media-type parameters and a leading `application/` removed, because RFC 7515
+/// §4.1.9 treats `JWT` and `application/jwt` as the same type.
+fn normalized_typ(typ: &str) -> String {
+    let typ = typ
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    typ.strip_prefix("application/").unwrap_or(&typ).to_string()
 }
 
 /// Default [`UserinfoJwtOptions::max_age`] in seconds.
@@ -1147,8 +1161,10 @@ impl<'a> UserinfoJwtOptions<'a> {
     /// that set a UserInfo-specific `typ`. This is a safe mode.
     ///
     /// `typ` must identify UserInfo specifically: an empty value, `JWT`,
-    /// `id_token+jwt` or `at+jwt` (case-insensitive) is refused with
-    /// [`Error::BadRequest`] when [`userinfo_signed_claims`] runs.
+    /// `id_token+jwt` or `at+jwt` (case-insensitive, with or without a leading
+    /// `application/`, since RFC 7515 §4.1.9 treats `JWT` and `application/jwt`
+    /// alike) is refused with [`Error::BadRequest`] when
+    /// [`userinfo_signed_claims`] runs.
     pub fn typed(typ: &'a str) -> Self {
         Self::with_trust(UserinfoTrust::Typed(typ))
     }
@@ -2578,7 +2594,14 @@ mod tests {
                 let err = run_userinfo(&resp, &jwks, o).unwrap_err();
                 assert!(err.to_string().contains("id_token"), "{claim}: {err}");
             }
-            for typ in ["id_token+jwt", "ID_Token+JWT", "at+jwt"] {
+            for typ in [
+                "id_token+jwt",
+                "ID_Token+JWT",
+                "at+jwt",
+                "application/id_token+jwt",
+                "Application/AT+JWT",
+                "application/at+jwt; charset=utf-8",
+            ] {
                 let (resp, jwks) = signed_userinfo_typ(&key, Some(typ), &[]);
                 assert!(run_userinfo(&resp, &jwks, o).is_err(), "{typ}");
             }
@@ -2605,7 +2628,21 @@ mod tests {
     fn userinfo_typed_rejects_generic_typ() {
         let (_c, _p, key) = client_and_provider();
         let (resp, jwks) = signed_userinfo_typ(&key, Some("userinfo+jwt"), &[]);
-        for typ in ["", "JWT", "jwt", "id_token+jwt", "ID_TOKEN+JWT", "at+jwt"] {
+        for typ in [
+            "",
+            "JWT",
+            "jwt",
+            "id_token+jwt",
+            "ID_TOKEN+JWT",
+            "at+jwt",
+            "application/jwt",
+            "Application/JWT",
+            " application/jwt ",
+            "application/id_token+jwt",
+            "application/at+jwt",
+            "application/",
+            "application/jwt; charset=utf-8",
+        ] {
             let err = run_userinfo(&resp, &jwks, &UserinfoJwtOptions::typed(typ)).unwrap_err();
             assert!(matches!(err, Error::BadRequest(_)), "{typ:?}: {err}");
         }
