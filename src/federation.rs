@@ -8,6 +8,7 @@
 use crate::error::{display_safe, Error, Result};
 use crate::http::HttpClient;
 use crate::keys::SigningKey;
+use crate::rp::{upstream_error, UpstreamKind};
 use crate::util::now_secs;
 use jose_rs::jwk::JwkSet;
 use jose_rs::jwt::{Claims, Validation};
@@ -180,14 +181,14 @@ pub async fn fetch_entity_configuration(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(crate::rp::upstream_error(
+        return Err(upstream_error(
+            UpstreamKind::Metadata,
             format!(
-                "internal error: entity config fetch {} returned {}",
+                "entity config fetch {} returned {}",
                 display_safe(&url),
                 resp.status
             ),
             &resp,
-            false,
         ));
     }
     Ok(resp.text())
@@ -260,14 +261,14 @@ async fn resolve_one(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(crate::rp::upstream_error(
+        return Err(upstream_error(
+            UpstreamKind::Metadata,
             format!(
-                "authentication error: resolve endpoint returned {} for {}",
+                "resolve endpoint returned {} for {}",
                 resp.status,
                 display_safe(sub)
             ),
             &resp,
-            false,
         ));
     }
 
@@ -433,10 +434,10 @@ pub async fn entity_metadata_jwks(
         crate::rp::validate_service_endpoint_for_issuer("jwks_uri", uri, subject_entity_id)?;
         let resp = http.get(uri).await?;
         if resp.status != 200 {
-            return Err(crate::rp::upstream_error(
-                format!("internal error: jwks fetch failed ({})", resp.status),
+            return Err(upstream_error(
+                UpstreamKind::Metadata,
+                format!("jwks fetch failed ({})", resp.status),
                 &resp,
-                false,
             ));
         }
         return JwkSet::from_json(&resp.text()).map_err(Error::from);
@@ -463,13 +464,10 @@ pub async fn fetch_signed_jwks(
     )?;
     let resp = http.get(signed_jwks_uri).await?;
     if resp.status != 200 {
-        return Err(crate::rp::upstream_error(
-            format!(
-                "internal error: signed_jwks_uri fetch failed ({})",
-                resp.status
-            ),
+        return Err(upstream_error(
+            UpstreamKind::Metadata,
+            format!("signed_jwks_uri fetch failed ({})", resp.status),
             &resp,
-            false,
         ));
     }
     if let Some(content_type) = resp.content_type.as_deref() {
@@ -543,14 +541,14 @@ pub async fn fetch_collection(
     );
     let resp = http.get(&url).await?;
     if resp.status != 200 {
-        return Err(crate::rp::upstream_error(
+        return Err(upstream_error(
+            UpstreamKind::Metadata,
             format!(
-                "internal error: collection endpoint {} returned {}",
+                "collection endpoint {} returned {}",
                 display_safe(&url),
                 resp.status
             ),
             &resp,
-            false,
         ));
     }
     let body: Value = resp.json()?;
@@ -1138,7 +1136,7 @@ mod tests {
         assert_upstream(
             &err,
             404,
-            "authentication error: resolve endpoint returned 404 for https://rp.example.com",
+            "internal error: resolve endpoint returned 404 for https://rp.example.com",
         );
     }
 

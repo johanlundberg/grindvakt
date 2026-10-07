@@ -282,12 +282,9 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
     let resp = http.get(&url).await?;
     if resp.status != 200 {
         return Err(upstream_error(
-            format!(
-                "internal error: discovery failed ({}) for {url}",
-                resp.status
-            ),
+            UpstreamKind::Metadata,
+            format!("discovery failed ({}) for {url}", resp.status),
             &resp,
-            false,
         ));
     }
     let metadata: ProviderMetadata = resp.json()?;
@@ -552,9 +549,9 @@ pub async fn fetch_jwks_response(
     let resp = http.get(jwks_uri).await?;
     if resp.status != 200 {
         return Err(upstream_error(
-            format!("internal error: jwks fetch failed ({})", resp.status),
+            UpstreamKind::Metadata,
+            format!("jwks fetch failed ({})", resp.status),
             &resp,
-            false,
         ));
     }
     let jwks = JwkSet::from_json(&resp.text()).map_err(Error::from)?;
@@ -603,13 +600,9 @@ pub async fn exchange_code(
         .await?;
     if resp.status != 200 {
         return Err(upstream_error(
-            format!(
-                "authentication error: token endpoint returned {}: {}",
-                resp.status,
-                sanitize_error_body(&resp.text())
-            ),
+            UpstreamKind::Auth,
+            format!("token endpoint returned {}", resp.status),
             &resp,
-            true,
         ));
     }
     let raw: serde_json::Value = resp.json()?;
@@ -618,12 +611,12 @@ pub async fn exchange_code(
         && raw.get("access_token").is_none()
     {
         return Err(upstream_error(
+            UpstreamKind::Auth,
             format!(
-                "authentication error: token endpoint returned an error with status {}",
+                "token endpoint returned an error with status {}",
                 resp.status
             ),
             &resp,
-            true,
         ));
     }
     let access_token = raw
@@ -1161,6 +1154,15 @@ pub async fn fetch_userinfo_response(
 ) -> Result<HttpFetchResponse> {
     validate_issuer(issuer)?;
     validate_service_endpoint_for_issuer("userinfo_endpoint", userinfo_endpoint, issuer)?;
+    if access_token.is_empty()
+        || access_token
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_whitespace() || !c.is_ascii())
+    {
+        return Err(Error::BadRequest(
+            "access_token contains characters not allowed in an Authorization header".into(),
+        ));
+    }
     let headers = vec![(
         "authorization".to_string(),
         format!("Bearer {access_token}"),
@@ -1171,23 +1173,30 @@ pub async fn fetch_userinfo_response(
     };
     if resp.status != 200 {
         return Err(upstream_error(
-            format!("authentication error: userinfo returned {}", resp.status),
+            UpstreamKind::Auth,
+            format!("userinfo returned {}", resp.status),
             &resp,
-            true,
         ));
     }
     // A broken OP can answer 200 with an RFC 6750 style JSON error body. A real
-    // UserInfo response carries `sub`; signed responses are not JSON objects.
-    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(&resp.body) {
-        if obj.get("error").is_some_and(serde_json::Value::is_string) && !obj.contains_key("sub") {
-            return Err(upstream_error(
-                format!(
-                    "authentication error: userinfo returned an error with status {}",
-                    resp.status
-                ),
-                &resp,
-                true,
-            ));
+    // UserInfo response carries `sub`; signed responses are not JSON objects, so
+    // only bodies that start with `{` are parsed.
+    let looks_like_object = resp
+        .body
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{');
+    if looks_like_object {
+        if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(&resp.body) {
+            if obj.get("error").is_some_and(serde_json::Value::is_string)
+                && !obj.contains_key("sub")
+            {
+                return Err(upstream_error(
+                    UpstreamKind::Auth,
+                    format!("userinfo returned an error with status {}", resp.status),
+                    &resp,
+                ));
+            }
         }
     }
     Ok(resp)
@@ -1258,17 +1267,33 @@ pub fn build_client_assertion(key: &SigningKey, client_id: &str, audience: &str)
     jwt::sign(key, &c, None)
 }
 
+/// Which kind of upstream request failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamKind {
+    /// Token and UserInfo requests: reported as authentication failures
+    /// (0.8 returned `Error::Authn`).
+    Auth,
+    /// Discovery, JWKS and federation metadata fetches (0.8 returned
+    /// `Error::Internal`).
+    Metadata,
+}
+
 /// Build a structured [`Error::UpstreamHttp`] from a non-success response.
 ///
 /// `error` / `error_description` come from a JSON object body with a string
 /// `error` (RFC 6749 §5.2); otherwise from the `WWW-Authenticate` header.
-/// `message` is the full `Display` text. `auth_failure` marks token and
-/// UserInfo requests, which 0.8 reported as `Error::Authn`.
+/// `message` is the bare text; the `Display` prefix and the `auth_failure`
+/// flag both derive from `kind`, so they cannot drift apart.
 pub(crate) fn upstream_error(
-    message: String,
+    kind: UpstreamKind,
+    message: impl std::fmt::Display,
     resp: &HttpFetchResponse,
-    auth_failure: bool,
 ) -> Error {
+    let (prefix, auth_failure) = match kind {
+        UpstreamKind::Auth => ("authentication error: ", true),
+        UpstreamKind::Metadata => ("internal error: ", false),
+    };
+    let message = format!("{prefix}{message}");
     let mut error = None;
     let mut description = None;
     if let Ok(serde_json::Value::Object(obj)) =
@@ -1307,17 +1332,6 @@ pub(crate) fn upstream_error(
         message,
         auth_failure,
     )))
-}
-
-/// Sanitize an upstream token-endpoint error body before embedding it in our
-/// error: control and bidi/format characters are stripped (log/terminal
-/// injection) and the text is truncated to 512 chars so a hostile or broken OP
-/// cannot blow up our logs or responses.
-fn sanitize_error_body(body: &str) -> String {
-    body.chars()
-        .filter(|c| !c.is_control() && !crate::error::is_bidi_format(*c))
-        .take(512)
-        .collect()
 }
 
 fn apply_client_auth(
@@ -1849,14 +1863,11 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.len() < 600,
-            "upstream body must be truncated: {}",
-            msg.len()
-        );
+        assert_eq!(msg, "authentication error: token endpoint returned 400");
+        assert!(!msg.contains("oops"), "{msg:?}");
         assert!(
             !msg.chars().any(|c| c.is_control()),
-            "control characters must be stripped: {msg:?}"
+            "control characters must not appear: {msg:?}"
         );
     }
 
@@ -1956,16 +1967,30 @@ mod tests {
         assert!(!d.chars().any(|c| c.is_control()));
         assert_eq!(
             err.to_string(),
-            format!(
-                "authentication error: token endpoint returned 400: {}",
-                sanitize_error_body(body)
-            )
-        );
-        assert_eq!(
-            err.to_string(),
-            "authentication error: token endpoint returned 400: {\"error\":\"invalid_grant\",\"error_description\":\"bad\\u001b[31m code\"}"
+            "authentication error: token endpoint returned 400"
         );
         assert_eq!(err.status_hint(), 502);
+    }
+
+    #[tokio::test]
+    async fn token_error_debug_and_display_do_not_leak_body() {
+        let (client, provider, _key) = client_and_provider();
+        let http = mock_post(crate::http::HttpFetchResponse::new(
+            400,
+            r#"{"error":"invalid_grant","error_description":"x","echo":"SECRET"}"#,
+        ));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:?}").contains("SECRET"), "{err:?}");
+        assert!(!err.to_string().contains("SECRET"));
+        assert!(err
+            .upstream_http()
+            .unwrap()
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("SECRET"));
     }
 
     #[tokio::test]
@@ -1991,13 +2016,10 @@ mod tests {
             err.upstream_http().unwrap().body.as_deref(),
             Some("a\\u{202e}b")
         );
-        // The Display text must not carry the bidi override either.
+        // The Display text carries no upstream body at all.
         let shown = err.to_string();
         assert!(!shown.contains('\u{202E}'));
-        assert_eq!(
-            shown,
-            "authentication error: token endpoint returned 400: ab"
-        );
+        assert_eq!(shown, "authentication error: token endpoint returned 400");
     }
 
     #[tokio::test]
@@ -2157,6 +2179,58 @@ mod tests {
         assert!(fetch_userinfo(&http, UI_URL, "at", "s1", UI_ISS)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn userinfo_rejects_bad_access_tokens_without_http() {
+        for token in ["", "a\r\nb", "a\nb", "a b", "tök", "a\tb", "a\u{7f}b"] {
+            let rec = RecordingHttp::new(json_userinfo("application/json"), true);
+            let http: Arc<dyn HttpClient> = rec.clone();
+            let err = fetch_userinfo_response(&http, UI_URL, token, UI_ISS, UserinfoMethod::Post)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::BadRequest(_)), "{token:?}: {err}");
+            assert!(!err.to_string().contains("tök"));
+            assert!(rec.calls.lock().unwrap().is_empty(), "{token:?}");
+        }
+        let rec = RecordingHttp::new(json_userinfo("application/json"), true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        fetch_userinfo_response(&http, UI_URL, "abc-._~+/=", UI_ISS, UserinfoMethod::Post)
+            .await
+            .unwrap();
+        assert_eq!(rec.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn userinfo_200_error_detection_only_for_json_objects() {
+        // A large JWT-like body is returned untouched.
+        let big = format!("eyJhbGciOiJFUzI1NiJ9.{}.sig", "A".repeat(100_000));
+        let rec = RecordingHttp::new(crate::http::HttpFetchResponse::new(200, big.clone()), true);
+        let http: Arc<dyn HttpClient> = rec.clone();
+        let resp = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
+            .await
+            .unwrap();
+        assert_eq!(resp.body, big.as_bytes());
+        // An error object, even after leading whitespace, still errors.
+        for body in [r#"{"error":"invalid_token"}"#, "\n  {\"error\":\"x\"}"] {
+            let rec = RecordingHttp::new(crate::http::HttpFetchResponse::new(200, body), true);
+            let http: Arc<dyn HttpClient> = rec.clone();
+            let err = fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
+                .await
+                .unwrap_err();
+            assert!(err.upstream_http().is_some(), "{body}");
+        }
+    }
+
+    #[test]
+    fn upstream_kind_maps_prefix_and_auth_flag() {
+        let resp = crate::http::HttpFetchResponse::new(500, "");
+        let auth = upstream_error(UpstreamKind::Auth, "x failed", &resp);
+        assert_eq!(auth.to_string(), "authentication error: x failed");
+        assert!(auth.is_auth_failure());
+        let meta = upstream_error(UpstreamKind::Metadata, "y failed", &resp);
+        assert_eq!(meta.to_string(), "internal error: y failed");
+        assert!(!meta.is_auth_failure());
     }
 
     fn signed_userinfo(
@@ -2992,5 +3066,13 @@ mod tests {
         assert!(err.to_string().contains("bidi"), "{err}");
         assert!(validate_service_endpoint("jwks_uri", "https://op.example.com/\u{200F}").is_err());
         assert!(!issuer_allows_loopback_http("http://localhost/\u{202E}"));
+        for c in ['\u{061C}', '\u{2028}', '\u{2029}'] {
+            let issuer = format!("https://op.example.com/{c}x");
+            assert!(validate_issuer(&issuer).is_err(), "{c:?}");
+            assert!(
+                validate_service_endpoint("jwks_uri", &issuer).is_err(),
+                "{c:?}"
+            );
+        }
     }
 }

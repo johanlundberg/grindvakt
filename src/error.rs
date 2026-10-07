@@ -142,7 +142,11 @@ impl std::fmt::Display for UpstreamHttpError {
 }
 
 pub(crate) fn is_bidi_format(c: char) -> bool {
-    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Make an attacker-controlled value safe to interpolate into an error
@@ -310,6 +314,9 @@ mod tests {
         assert_eq!(escape_upstream_text("a\x1bb", 64), "a\\u{1b}b");
         assert_eq!(escape_upstream_text("x\u{202E}y", 64), "x\\u{202e}y");
         assert_eq!(escape_upstream_text("åäö", 64), "åäö");
+        assert_eq!(escape_upstream_text("a\u{61c}b", 64), "a\\u{61c}b");
+        assert_eq!(escape_upstream_text("a\u{2028}b", 64), "a\\u{2028}b");
+        assert_eq!(escape_upstream_text("a\u{2029}b", 64), "a\\u{2029}b");
     }
 
     #[test]
