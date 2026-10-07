@@ -529,7 +529,7 @@ impl JwksResponse {
     pub fn advertised_ttl_secs(&self) -> Option<u64> {
         let header = self.cache_control.as_deref()?;
         let mut max_age = None;
-        for directive in header.split(',') {
+        for directive in split_cache_directives(header) {
             let directive = directive.trim();
             let (name, value) = match directive.split_once('=') {
                 Some((n, v)) => (n.trim(), Some(v.trim())),
@@ -547,6 +547,28 @@ impl JwksResponse {
         }
         max_age
     }
+}
+
+/// Split a `Cache-Control` value into directives at commas that are outside
+/// quoted strings, honouring backslash escapes inside quotes (RFC 9110 §5.6.4),
+/// so a quoted extension value cannot smuggle in a directive.
+fn split_cache_directives(header: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
+    for (i, c) in header.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if in_quotes && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c == ',' && !in_quotes {
+            out.push(&header[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&header[start..]);
+    out
 }
 
 /// Like [`fetch_jwks`] but also returns `Cache-Control` and `ETag` so callers
@@ -1695,6 +1717,25 @@ mod tests {
         .await
         .expect("loopback issuer may fetch a loopback HTTP JWKS");
         assert_eq!(fetched.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn jwks_ttl_ignores_directives_inside_quoted_values() {
+        // The quoted extension value must not be read as a max-age directive.
+        let r = jwks_response_with(Some(r#"foo="x, max-age=86400", max-age=60"#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(60));
+        // Nor as no-store.
+        let r = jwks_response_with(Some(r#"foo="a, no-store", max-age=30"#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(30));
+        // Escaped quotes do not end the quoted string early.
+        let r = jwks_response_with(Some(r#"foo="a\", max-age=999", max-age=15"#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(15));
+        // An unterminated quote swallows the rest rather than yielding a lifetime.
+        let r = jwks_response_with(Some(r#"foo="oops, max-age=500"#)).await;
+        assert_eq!(r.advertised_ttl_secs(), None);
+        // Real directives around quoted values still work.
+        let r = jwks_response_with(Some(r#"max-age=20, foo="x,y""#)).await;
+        assert_eq!(r.advertised_ttl_secs(), Some(20));
     }
 
     async fn jwks_response_with_age(cache_control: &str, age: Option<&str>) -> JwksResponse {
