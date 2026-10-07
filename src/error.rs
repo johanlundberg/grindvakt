@@ -65,11 +65,13 @@ pub enum Error {
 /// are escaped (for example `\u{1b}`) and lengths are capped, so the values
 /// cannot inject terminal or log escapes.
 ///
-/// Sanitizing does not make [`UpstreamHttpError::body`] safe to log verbatim:
-/// upstream error bodies can echo submitted values (codes, `state`, PKCE
-/// verifiers) or carry personal data. The `Debug` implementation therefore
-/// redacts the body and prints only its length; do not copy `body` into logs
-/// or into any HTTP, JSON or other serialized error surface.
+/// Sanitizing does not make [`UpstreamHttpError::body`] or
+/// [`UpstreamHttpError::error_description`] safe to log verbatim: upstream
+/// errors can echo submitted values (codes, `state`, PKCE verifiers) or carry
+/// personal data. The `Debug` implementation therefore redacts both and prints
+/// only their length; the fields stay readable. Do not copy them into logs or
+/// into any HTTP, JSON or other serialized error surface. `error` (the OAuth
+/// error code, capped at 64 characters) is not redacted.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct UpstreamHttpError {
@@ -78,6 +80,8 @@ pub struct UpstreamHttpError {
     /// OAuth `error` code, from the JSON body or `WWW-Authenticate` header.
     pub error: Option<String>,
     /// OAuth `error_description`, from the JSON body or `WWW-Authenticate`.
+    /// Free text from the upstream that may echo secrets: never log it
+    /// verbatim or return it to end users.
     pub error_description: Option<String>,
     /// Response body, escaped and length capped. May contain echoed secrets or
     /// personal data: never log it verbatim or return it to end users.
@@ -124,10 +128,14 @@ impl std::fmt::Debug for UpstreamHttpError {
             .body
             .as_ref()
             .map(|b| format!("<redacted, {} chars>", b.chars().count()));
+        let description = self
+            .error_description
+            .as_ref()
+            .map(|d| format!("<redacted, {} chars>", d.chars().count()));
         f.debug_struct("UpstreamHttpError")
             .field("status", &self.status)
             .field("error", &self.error)
-            .field("error_description", &self.error_description)
+            .field("error_description", &description)
             .field("body", &body)
             .field("message", &self.message)
             .field("auth_failure", &self.auth_failure)
@@ -347,7 +355,7 @@ mod tests {
         let e = super::UpstreamHttpError::new(
             Some(400),
             Some("invalid_grant".into()),
-            None,
+            Some("rejected code SECRET-DESC".into()),
             Some("code=SECRET-CODE verifier=SECRET".into()),
             "authentication error: token endpoint returned 400".into(),
             true,
@@ -361,6 +369,10 @@ mod tests {
         assert!(dbg.contains("invalid_grant"));
         // The body stays available to callers that ask for it.
         assert!(e.body.as_deref().unwrap().contains("SECRET-CODE"));
+        assert_eq!(
+            e.error_description.as_deref(),
+            Some("rejected code SECRET-DESC")
+        );
     }
 
     use super::*;

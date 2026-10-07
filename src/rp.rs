@@ -2045,6 +2045,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_description_is_redacted_in_debug_but_readable() {
+        let (client, provider, _key) = client_and_provider();
+        let body = r#"{"error":"invalid_grant","error_description":"rejected code SECRET-DESC"}"#;
+        let http = mock_post(crate::http::HttpFetchResponse::new(400, body));
+        let err = exchange_code(&http, &provider, &client, "c", None)
+            .await
+            .unwrap_err();
+        let dbg = format!("{err:?}");
+        assert!(!dbg.contains("SECRET-DESC"), "{dbg}");
+        assert!(!err.to_string().contains("SECRET-DESC"));
+        assert_eq!(
+            err.upstream_http().unwrap().error_description.as_deref(),
+            Some("rejected code SECRET-DESC")
+        );
+
+        // Same for a description taken from WWW-Authenticate.
+        let resp = crate::http::HttpFetchResponse::new(401, "").with_header(
+            "WWW-Authenticate",
+            r#"Bearer error="invalid_token", error_description="rejected SECRET-HDR""#,
+        );
+        let http = mock_post(resp);
+        let err = fetch_userinfo(
+            &http,
+            "https://op.example.org/userinfo",
+            "tok",
+            "sub",
+            "https://op.example.org",
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{err:?}").contains("SECRET-HDR"));
+        assert_eq!(
+            err.upstream_http().unwrap().error_description.as_deref(),
+            Some("rejected SECRET-HDR")
+        );
+    }
+
+    #[tokio::test]
     async fn token_error_is_structured_and_escaped() {
         let (client, provider, _key) = client_and_provider();
         let body = r#"{"error":"invalid_grant","error_description":"bad\u001b[31m code"}"#;
