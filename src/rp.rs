@@ -946,6 +946,7 @@ mod tests {
             status: 200,
             body: serde_json::to_vec(&metadata).unwrap(),
             content_type: Some("application/json".into()),
+            ..Default::default()
         }
     }
 
@@ -991,6 +992,7 @@ mod tests {
                 status: 200,
                 body: key.to_public_jwks().to_json().unwrap().into_bytes(),
                 content_type: Some("application/json".into()),
+                ..Default::default()
             }),
             post: None,
         });
@@ -1028,6 +1030,7 @@ mod tests {
             status: 200,
             body: serde_json::to_vec(&body).unwrap(),
             content_type: Some("application/json".into()),
+            ..Default::default()
         }
     }
 
@@ -1089,6 +1092,7 @@ mod tests {
                 status: 400,
                 body: body.into_bytes(),
                 content_type: None,
+                ..Default::default()
             }),
         });
         let err = exchange_code(&http, &provider, &client, "code-1", None)

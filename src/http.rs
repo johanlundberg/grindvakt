@@ -144,19 +144,99 @@ pub trait HttpClient: Send + Sync {
 }
 
 /// The result of an outbound fetch.
-#[derive(Debug, Clone)]
+///
+/// `HttpClient` implementations should fill in both `content_type` and
+/// `headers`. Prefer [`HttpFetchResponse::new`] and
+/// [`HttpFetchResponse::with_header`], or a struct literal ending in
+/// `..Default::default()`, so new fields do not break the construction site.
+/// `content_type` stays authoritative for existing readers such as
+/// `federation::fetch_signed_jwks`; `headers` carries everything else
+/// (for example `Cache-Control`).
+#[derive(Debug, Clone, Default)]
 pub struct HttpFetchResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub content_type: Option<String>,
+    /// Response headers, names lower-cased, in order; repeated headers kept.
+    pub headers: Vec<(String, String)>,
 }
 
 impl HttpFetchResponse {
+    /// A response with a status and body and no headers.
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Append a header. The stored name is lower-cased. A `Content-Type`
+    /// header also sets `content_type` when it is still unset.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let name = name.into().to_ascii_lowercase();
+        let value = value.into();
+        if name == "content-type" && self.content_type.is_none() {
+            self.content_type = Some(value.clone());
+        }
+        self.headers.push((name, value));
+        self
+    }
+
+    /// The first header value with this name, compared case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The `Cache-Control` header value, if present.
+    pub fn cache_control(&self) -> Option<&str> {
+        self.header("cache-control")
+    }
+
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> crate::error::Result<T> {
         serde_json::from_slice(&self.body).map_err(crate::error::Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_lookup_is_case_insensitive_and_returns_first() {
+        let r = HttpFetchResponse::new(200, "x")
+            .with_header("X-Thing", "one")
+            .with_header("x-thing", "two");
+        assert_eq!(r.header("X-THING"), Some("one"));
+        assert_eq!(r.headers.len(), 2);
+        assert_eq!(r.header("missing"), None);
+    }
+
+    #[test]
+    fn cache_control_reads_header() {
+        let r = HttpFetchResponse::new(200, Vec::new()).with_header("Cache-Control", "max-age=60");
+        assert_eq!(r.cache_control(), Some("max-age=60"));
+        assert_eq!(HttpFetchResponse::default().cache_control(), None);
+    }
+
+    #[test]
+    fn content_type_header_fills_content_type() {
+        let r = HttpFetchResponse::new(200, Vec::new()).with_header("Content-Type", "text/plain");
+        assert_eq!(r.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(r.headers[0].0, "content-type");
+    }
+
+    #[test]
+    fn default_has_empty_headers() {
+        let r = HttpFetchResponse::default();
+        assert!(r.headers.is_empty());
+        assert_eq!(r.status, 0);
     }
 }

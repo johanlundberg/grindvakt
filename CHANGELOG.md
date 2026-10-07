@@ -12,6 +12,12 @@
   `rp::discover` now accepts providers that do not advertise UserInfo. Use
   the new `ProviderInfo::require_userinfo_endpoint` / `require_jwks_uri` to
   get a clear error when an endpoint is missing.
+- **Breaking:** `HttpFetchResponse` has a new `headers` field (lower-cased
+  names, in order) so callers can honour `Cache-Control` and similar headers
+  when caching JWKS. It now implements `Default` and gains `new`,
+  `with_header`, `header` and `cache_control`. `HttpClient` implementations
+  should fill in `headers`. Code that builds it with a struct literal must add
+  the field or use `..Default::default()`.
 
 ## 0.8.2 [2026-09-28]
 

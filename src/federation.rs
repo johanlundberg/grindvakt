@@ -720,6 +720,7 @@ mod tests {
                 status: 200,
                 body: serde_json::to_vec(&subject_jwks).unwrap(),
                 content_type: Some("application/json".into()),
+                ..Default::default()
             },
         });
         let http: Arc<dyn HttpClient> = recording.clone();
@@ -767,6 +768,7 @@ mod tests {
                 status: 200,
                 body: serde_json::to_vec(&subject_jwks).unwrap(),
                 content_type: Some("application/json".into()),
+                ..Default::default()
             },
         });
         let http: Arc<dyn HttpClient> = recording.clone();
