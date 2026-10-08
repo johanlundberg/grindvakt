@@ -176,17 +176,18 @@ pub(crate) fn is_invisible_format(c: char) -> bool {
             // space/joiners, word joiner and invisible operators, deprecated
             // formatting, BOM, interlinear annotation, and similar.
             | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}'
-            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
-            | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF0}'..='\u{FFFB}'
             | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}'
             | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
             // Invisible fillers and variation selectors.
             | '\u{034F}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
             | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}'
-            | '\u{E0100}'..='\u{E01EF}'
-            // Tag characters, invisible and able to carry hidden data.
-            | '\u{E0000}'..='\u{E007F}'
+            // Tag characters (invisible, able to carry hidden data), the
+            // variation selectors supplement and the unassigned
+            // default-ignorable code points around them.
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
@@ -456,11 +457,19 @@ mod tests {
             '\u{3164}',
             '\u{FFA0}',
             '\u{034F}',
+            '\u{180B}',
+            '\u{180C}',
+            '\u{180D}',
             '\u{180E}',
+            '\u{180F}',
+            '\u{2065}',
+            '\u{FFF0}',
             '\u{FE0F}',
             '\u{E0001}',
             '\u{E0041}',
             '\u{E007F}',
+            '\u{E0100}',
+            '\u{E0FFF}',
             '\u{206A}',
         ] {
             let escaped = escape_upstream_text(&format!("a{c}b"), 64);

@@ -3795,6 +3795,13 @@ mod tests {
             '\u{3164}',
             '\u{E0001}',
             '\u{FE0F}',
+            '\u{180B}',
+            '\u{180C}',
+            '\u{180D}',
+            '\u{180E}',
+            '\u{180F}',
+            '\u{2065}',
+            '\u{E0100}',
         ] {
             // In the path, and in the host (the look-alike issuer case).
             for issuer in [
