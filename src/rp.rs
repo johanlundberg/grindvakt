@@ -705,6 +705,9 @@ pub async fn exchange_code(
 
 /// Verify an id_token against the provider JWKS, issuer, audience and nonce.
 ///
+/// When `jwks` holds more than one key the id_token must carry a `kid`, as
+/// OIDC Core §10.1 requires; a set with a single key needs none.
+///
 /// Uses jose-rs's default 60-second clock-skew leeway. See
 /// [`verify_id_token_with`] to tune the leeway or to enforce `max_age`, `acr`
 /// and `at_hash`.
@@ -833,6 +836,9 @@ impl<'a> IdTokenOptions<'a> {
 
 /// Like [`verify_id_token`] with additional [`IdTokenOptions`].
 ///
+/// When `jwks` holds more than one key the id_token must carry a `kid`
+/// (OIDC Core §10.1); a set with a single key needs none.
+///
 /// The extra checks run after the `sub`, `aud`, `azp` and `nonce` checks.
 /// `max_age` is checked against `auth_time` (not `iat`) and rejects tokens
 /// without a numeric `auth_time`.
@@ -880,6 +886,17 @@ pub fn verify_id_token_with(
         .with_allowed_algorithms(allowed_algorithms.to_vec());
     if let Some(leeway) = options.leeway {
         validation = validation.with_leeway(leeway);
+    }
+    // OIDC Core §10.1 requires `kid` when the JWK Set has several keys. Without
+    // it jose-rs tries every key, so a token signed by any key in the set would
+    // verify. A single-key set needs no `kid` (it is optional in RFC 7515).
+    if jwks.keys.len() > 1 {
+        if jwt::peek_header(id_token)?.kid.is_none() {
+            return Err(Error::Authn(
+                "id_token has no kid but the JWK Set has several keys".into(),
+            ));
+        }
+        validation = validation.require_kid();
     }
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
 
@@ -3207,6 +3224,54 @@ mod tests {
     #[test]
     fn default_leeway_constant_matches_jose() {
         assert_eq!(Validation::default().leeway, DEFAULT_LEEWAY);
+    }
+
+    #[test]
+    fn id_token_kid_required_only_for_multi_key_sets() {
+        // One key without a kid, and a second unrelated key.
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let kidless =
+            signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), None).unwrap();
+        let (_c, _p, other) = client_and_provider();
+        let es = JwsAlgorithm::ES256;
+
+        let (token, single) = opts_token(&kidless, |_| {});
+        assert!(jwt::peek_header(&token).unwrap().kid.is_none());
+        // In spec: a single-key set needs no kid, for the wrapper and the options API.
+        verify_with(&single, &token, es, &IdTokenOptions::new()).unwrap();
+        verify_id_token(
+            &single,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[es],
+            &[],
+        )
+        .unwrap();
+
+        // Several keys: a kid-less token is refused, through both entry points.
+        let mut mixed = other.to_public_jwks();
+        mixed.keys.extend(single.keys.clone());
+        assert_eq!(mixed.keys.len(), 2);
+        let err = verify_with(&mixed, &token, es, &IdTokenOptions::new()).unwrap_err();
+        assert!(err.to_string().contains("several keys"), "{err}");
+        assert!(verify_id_token(
+            &mixed,
+            &token,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[es],
+            &[],
+        )
+        .is_err());
+
+        // A token that names its key still verifies against the same multi-key set.
+        let (named, _) = opts_token(&other, |_| {});
+        assert!(jwt::peek_header(&named).unwrap().kid.is_some());
+        verify_with(&mixed, &named, es, &IdTokenOptions::new()).unwrap();
     }
 
     #[test]
