@@ -1050,6 +1050,12 @@ fn auth_time_secs(value: &serde_json::Value) -> Result<u64> {
 ///   even if it has no `exp`. [`UserinfoJwtOptions::without_max_age`] removes
 ///   the bound; use it only for OPs that emit neither `iat` nor `exp`, and
 ///   accept that replay is then unbounded.
+/// - **The token must carry a `kid`** naming a key in `jwks`, in every mode.
+///   Otherwise it would be tried against every key in the set, so a token
+///   signed by any key in a mixed-trust JWKS would verify. For an OP that
+///   publishes a single key and sets no `kid` (conforming, since `kid` is only
+///   required for multi-key sets), opt out with
+///   [`UserinfoJwtOptions::allow_missing_kid`]; a multi-key set always needs it.
 /// - **The audience must be exactly `client_id`** (a string, or an array with
 ///   that single element). Multi-audience and duplicated-audience tokens are
 ///   refused in every mode, unlike `jose-rs`' membership check.
@@ -1093,10 +1099,26 @@ pub fn userinfo_signed_claims(
         ));
     }
     let token = resp.text();
+    // The token must name its key. Without `kid`, jose-rs tries every key in
+    // the set, so a token signed by any key in a mixed-trust JWKS (the
+    // `dedicated_keys` attestation cannot be checked) would verify. A missing
+    // `kid` is only tolerated, on request, for a single-key set, where there is
+    // nothing to be ambiguous about and the spec does not require it.
+    let require_kid = jwks.keys.len() > 1 || !options.allow_missing_kid;
+    if require_kid && jwt::peek_header(token.trim())?.kid.is_none() {
+        return Err(Error::Authn(if jwks.keys.len() > 1 {
+            "signed userinfo has no kid but the JWK Set has several keys".into()
+        } else {
+            "signed userinfo has no kid; use UserinfoJwtOptions::allow_missing_kid for an OP that publishes a single key without kid".into()
+        }));
+    }
     let mut validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
         .with_allowed_algorithms(allowed_algorithms.to_vec());
+    if require_kid {
+        validation = validation.require_kid();
+    }
     if options.require_exp {
         validation = validation.require_exp();
     }
@@ -1191,6 +1213,10 @@ pub struct UserinfoJwtOptions<'a> {
     /// ("allow undated"): only for OPs that emit neither `iat` nor `exp`, and
     /// then replay is unbounded.
     pub max_age: Option<u64>,
+    /// Accept a token without `kid` when `jwks` holds exactly one key. Default
+    /// false: the token must name its key. See
+    /// [`UserinfoJwtOptions::allow_missing_kid`].
+    pub allow_missing_kid: bool,
     trust: UserinfoTrust<'a>,
 }
 
@@ -1199,8 +1225,25 @@ impl<'a> UserinfoJwtOptions<'a> {
         Self {
             require_exp: false,
             max_age: Some(DEFAULT_USERINFO_JWT_MAX_AGE),
+            allow_missing_kid: false,
             trust,
         }
+    }
+
+    /// Accept a token that has no `kid`, but only when `jwks` holds exactly one
+    /// key.
+    ///
+    /// By default the token must carry a `kid` naming a key in the set;
+    /// otherwise jose-rs would try every key, so a token signed by any key in
+    /// a mixed-trust set would verify. `kid` is optional in RFC 7515 and
+    /// OIDC Core §10.1 only requires it when the JWK Set has more than one
+    /// key, so an OP that publishes a single key and sets no `kid` is
+    /// conforming; this is the compatibility switch for it. It has no effect
+    /// on a set of two or more keys, where a missing `kid` stays an error
+    /// because it is out of spec and ambiguous.
+    pub fn allow_missing_kid(mut self) -> Self {
+        self.allow_missing_kid = true;
+        self
     }
 
     /// Require the JOSE `typ` header to equal `typ` (RFC 8725 §3.11), for OPs
@@ -2783,6 +2826,80 @@ mod tests {
                 assert!(matches!(err, Error::Authn(_)), "{err}");
             }
         }
+    }
+
+    fn kidless_key_and_response() -> (SigningKey, crate::http::HttpFetchResponse) {
+        // A key without a kid signs a token that names no key.
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let key = signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), None).unwrap();
+        let c = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Single("https://rp.example.com".into())),
+            iat: Some(now_secs()),
+            ..Default::default()
+        };
+        let token = jwt::sign(&key, &c, Some("userinfo+jwt")).unwrap();
+        assert!(jwt::peek_header(&token).unwrap().kid.is_none());
+        let resp = crate::http::HttpFetchResponse::new(200, token)
+            .with_header("Content-Type", "application/jwt");
+        (key, resp)
+    }
+
+    fn all_modes() -> Vec<UserinfoJwtOptions<'static>> {
+        vec![
+            UserinfoJwtOptions::typed("userinfo+jwt"),
+            UserinfoJwtOptions::dedicated_keys(),
+            UserinfoJwtOptions::untyped_shared_key_compat(),
+        ]
+    }
+
+    #[test]
+    fn userinfo_requires_kid_by_default_in_every_mode() {
+        let (key, resp) = kidless_key_and_response();
+        let jwks = key.to_public_jwks();
+        for o in all_modes() {
+            let err = run_userinfo(&resp, &jwks, &o).unwrap_err();
+            assert!(err.to_string().contains("allow_missing_kid"), "{err}");
+        }
+        // A token that names a key is unaffected.
+        let (_c, _p, trusted) = client_and_provider();
+        let (ok, jwks) = signed_userinfo_typ(&trusted, None, &[]);
+        run_userinfo(&ok, &jwks, &UserinfoJwtOptions::dedicated_keys()).unwrap();
+    }
+
+    #[test]
+    fn userinfo_allow_missing_kid_only_for_a_single_key_set() {
+        let (key, resp) = kidless_key_and_response();
+        // In spec: one key, no kid. Accepted when the caller opts in, in every mode.
+        let single = key.to_public_jwks();
+        assert_eq!(single.keys.len(), 1);
+        for o in all_modes() {
+            let o = o.allow_missing_kid();
+            assert_eq!(run_userinfo(&resp, &single, &o).unwrap()["sub"], "subject");
+        }
+
+        // Out of spec and ambiguous: several keys. The opt-in does not help.
+        let (_c, _p, other) = client_and_provider();
+        let mut mixed = other.to_public_jwks();
+        mixed.keys.extend(key.to_public_jwks().keys);
+        assert_eq!(mixed.keys.len(), 2);
+        for o in all_modes() {
+            let err = run_userinfo(&resp, &mixed, &o.allow_missing_kid()).unwrap_err();
+            assert!(err.to_string().contains("several keys"), "{err}");
+        }
+        // Without the opt-in the single-key case is also refused (covered above),
+        // and a kid that is present but unknown is refused either way.
+        let (_c, _p, trusted) = client_and_provider();
+        let (named, _) = signed_userinfo_typ(&trusted, None, &[]);
+        let wrong_set = key.to_public_jwks();
+        assert!(run_userinfo(
+            &named,
+            &wrong_set,
+            &UserinfoJwtOptions::dedicated_keys().allow_missing_kid()
+        )
+        .is_err());
     }
 
     #[test]
