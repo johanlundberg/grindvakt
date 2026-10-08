@@ -1409,11 +1409,12 @@ pub async fn fetch_userinfo_response(
     // A broken OP can answer 200 with an RFC 6750 style JSON error body. A real
     // UserInfo response carries `sub`; signed responses are not JSON objects, so
     // only bodies that start with `{` are parsed.
-    let looks_like_object = resp
-        .body
-        .iter()
-        .find(|b| !b.is_ascii_whitespace())
-        .is_some_and(|b| *b == b'{');
+    let looks_like_object = resp.body.len() <= MAX_ERROR_JSON_BYTES
+        && resp
+            .body
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| *b == b'{');
     if looks_like_object {
         if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(&resp.body) {
             if obj.get("error").is_some_and(serde_json::Value::is_string)
@@ -1515,6 +1516,17 @@ pub(crate) enum UpstreamKind {
 /// Longest `UpstreamHttpError` message, in characters, before truncation.
 const MAX_UPSTREAM_MESSAGE_CHARS: usize = 1024;
 
+/// Byte budget for extracting OAuth error fields from an upstream body. An
+/// RFC 6749 error object is tiny; a larger body is not parsed at all, so a
+/// hostile upstream cannot make us allocate a large JSON tree per failure.
+const MAX_ERROR_JSON_BYTES: usize = 16 * 1024;
+
+/// Byte budget for the `WWW-Authenticate` header values parsed for an error.
+const MAX_ERROR_HEADER_BYTES: usize = 8 * 1024;
+
+/// Characters kept from an upstream body excerpt.
+const MAX_ERROR_BODY_CHARS: usize = 512;
+
 pub(crate) fn upstream_error(
     kind: UpstreamKind,
     message: impl std::fmt::Display,
@@ -1533,30 +1545,40 @@ pub(crate) fn upstream_error(
     }
     let mut error = None;
     let mut description = None;
-    if let Ok(serde_json::Value::Object(obj)) =
-        serde_json::from_slice::<serde_json::Value>(&resp.body)
-    {
-        if let Some(code) = obj.get("error").and_then(|v| v.as_str()) {
-            error = Some(escape_upstream_text(code, 64));
-            description = obj
-                .get("error_description")
-                .and_then(|v| v.as_str())
-                .map(|d| escape_upstream_text(d, 256));
+    // Structured extraction is skipped for oversized bodies; the capped excerpt
+    // and the header fallback below still apply.
+    if resp.body.len() <= MAX_ERROR_JSON_BYTES {
+        if let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_slice::<serde_json::Value>(&resp.body)
+        {
+            if let Some(code) = obj.get("error").and_then(|v| v.as_str()) {
+                error = Some(escape_upstream_text(code, 64));
+                description = obj
+                    .get("error_description")
+                    .and_then(|v| v.as_str())
+                    .map(|d| escape_upstream_text(d, 256));
+            }
         }
     }
     if error.is_none() {
-        let challenges = resp.header_values("www-authenticate").join(", ");
-        if let Some((e, d)) = parse_www_authenticate_bearer(&challenges) {
-            error = e.map(|e| escape_upstream_text(&e, 64));
-            description = d.map(|d| escape_upstream_text(&d, 256));
+        let values = resp.header_values("www-authenticate");
+        if values.iter().map(|v| v.len()).sum::<usize>() <= MAX_ERROR_HEADER_BYTES {
+            if let Some((e, d)) = parse_www_authenticate_bearer(&values.join(", ")) {
+                error = e.map(|e| escape_upstream_text(&e, 64));
+                description = d.map(|d| escape_upstream_text(&d, 256));
+            }
         }
     }
+    // Decode only a prefix: at most 4 bytes per character, plus one character of
+    // slack so a longer body always shows the truncation marker.
+    let excerpt_bytes = (MAX_ERROR_BODY_CHARS + 1) * 4;
     let body = if resp.body.is_empty() {
         None
     } else {
+        let prefix = &resp.body[..resp.body.len().min(excerpt_bytes)];
         Some(escape_upstream_text(
-            &String::from_utf8_lossy(&resp.body),
-            512,
+            &String::from_utf8_lossy(prefix),
+            MAX_ERROR_BODY_CHARS,
         ))
     };
     Error::UpstreamHttp(Box::new(UpstreamHttpError::new(
@@ -2269,6 +2291,57 @@ mod tests {
         fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_error_bodies_and_headers_are_not_parsed() {
+        // A small error object is parsed.
+        let small = r#"{"error":"invalid_grant","error_description":"x"}"#;
+        let resp = crate::http::HttpFetchResponse::new(503, small);
+        let err = upstream_error(UpstreamKind::Metadata, "m", &resp);
+        assert_eq!(
+            err.upstream_http().unwrap().error.as_deref(),
+            Some("invalid_grant")
+        );
+
+        // The same object padded past the budget is not: no error fields, but the
+        // status, the capped excerpt and the truncation marker remain.
+        let pad = "z".repeat(MAX_ERROR_JSON_BYTES);
+        let big = format!(r#"{{"error":"invalid_grant","pad":"{pad}"}}"#);
+        let resp = crate::http::HttpFetchResponse::new(503, big);
+        let err = upstream_error(UpstreamKind::Metadata, "m", &resp);
+        let up = err.upstream_http().unwrap();
+        assert_eq!((up.status, up.error.as_deref()), (Some(503), None));
+        let body = up.body.as_deref().unwrap();
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+        assert!(body.ends_with('…'));
+
+        // An oversized body still falls back to WWW-Authenticate.
+        let resp = crate::http::HttpFetchResponse::new(401, vec![b'['; MAX_ERROR_JSON_BYTES + 1])
+            .with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        let err = upstream_error(UpstreamKind::Auth, "m", &resp);
+        assert_eq!(
+            err.upstream_http().unwrap().error.as_deref(),
+            Some("invalid_token")
+        );
+
+        // An oversized header is not parsed.
+        let long = format!(
+            r#"Bearer error="invalid_token", x="{}""#,
+            "y".repeat(MAX_ERROR_HEADER_BYTES)
+        );
+        let resp =
+            crate::http::HttpFetchResponse::new(401, "").with_header("WWW-Authenticate", long);
+        let err = upstream_error(UpstreamKind::Auth, "m", &resp);
+        assert_eq!(err.upstream_http().unwrap().error, None);
+
+        // Multi-byte bodies are cut on a character boundary and marked.
+        let wide = "é".repeat(5000);
+        let resp = crate::http::HttpFetchResponse::new(500, wide);
+        let err = upstream_error(UpstreamKind::Metadata, "m", &resp);
+        let body = err.upstream_http().unwrap().body.clone().unwrap();
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+        assert!(body.ends_with('…'));
     }
 
     #[tokio::test]
