@@ -728,7 +728,7 @@ pub fn verify_id_token(
         expected_nonce,
         allowed_algorithms,
         trusted_additional_audiences,
-        &IdTokenOptions::default(),
+        &IdTokenOptions::default().allow_unchecked_hashes(),
     )
 }
 
@@ -770,10 +770,18 @@ pub struct IdTokenOptions<'a> {
     /// Fail when the id_token has no `c_hash`. Requires `authorization_code`;
     /// without one the options are a configuration error (`Error::BadRequest`).
     pub require_c_hash: bool,
+    /// Accept an id_token that carries `at_hash` or `c_hash` although no
+    /// access token / authorization code was supplied to check it against.
+    /// Default false: such a claim is an error, because the binding it exists
+    /// for would otherwise be silently skipped. See
+    /// [`IdTokenOptions::allow_unchecked_hashes`].
+    pub allow_unchecked_hashes: bool,
 }
 
 impl<'a> IdTokenOptions<'a> {
-    /// Options that add no checks beyond [`verify_id_token`].
+    /// Default options. Unlike [`verify_id_token`], an id_token carrying
+    /// `at_hash` or `c_hash` is refused unless the matching value is supplied
+    /// or [`IdTokenOptions::allow_unchecked_hashes`] is set.
     pub fn new() -> Self {
         Self::default()
     }
@@ -830,6 +838,20 @@ impl<'a> IdTokenOptions<'a> {
     /// [`IdTokenOptions::with_authorization_code`].
     pub fn with_required_c_hash(mut self) -> Self {
         self.require_c_hash = true;
+        self
+    }
+
+    /// Accept an id_token that carries `at_hash` or `c_hash` when no value was
+    /// supplied to check it against.
+    ///
+    /// By default [`verify_id_token_with`] fails in that case, so the claim
+    /// is never silently left unchecked. In the authorization code flow the
+    /// RP may validate `at_hash` but need not (OIDC Core §3.1.3.7), so a flow
+    /// that does not use the hash can opt out here; for implicit and hybrid
+    /// flows (§3.2.2.9, §3.3.2.12) the hash must be checked, so do not opt
+    /// out there. [`verify_id_token`] sets this to keep its 0.8 behaviour.
+    pub fn allow_unchecked_hashes(mut self) -> Self {
+        self.allow_unchecked_hashes = true;
         self
     }
 }
@@ -975,6 +997,7 @@ pub fn verify_id_token_with(
         "at_hash",
         options.access_token,
         options.require_at_hash,
+        options.allow_unchecked_hashes,
     )?;
     check_token_hash(
         &claims,
@@ -982,6 +1005,7 @@ pub fn verify_id_token_with(
         "c_hash",
         options.authorization_code,
         options.require_c_hash,
+        options.allow_unchecked_hashes,
     )?;
     Ok(claims)
 }
@@ -994,10 +1018,16 @@ fn check_token_hash(
     claim: &str,
     value: Option<&str>,
     required: bool,
+    allow_unchecked: bool,
 ) -> Result<()> {
     let present = claims.extra.get(claim);
     if required && present.is_none() {
         return Err(Error::Authn(format!("id_token missing {claim}")));
+    }
+    if value.is_none() && present.is_some() && !allow_unchecked {
+        return Err(Error::Authn(format!(
+            "id_token carries {claim} but no value was supplied to verify it against; pass it, or use allow_unchecked_hashes"
+        )));
     }
     if let (Some(value), Some(present)) = (value, present) {
         let claimed = present
@@ -3496,8 +3526,27 @@ mod tests {
             c.extra.insert("at_hash".into(), good.clone().into());
         });
         verify_with(&jwks, &t, es, &opts).unwrap();
-        // Present without the option: not checked.
-        verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap();
+        // Present but nothing supplied to check it against: refused by default,
+        // accepted only on request (and by the 0.8-compatible wrapper).
+        let err = verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap_err();
+        assert!(err.to_string().contains("at_hash"), "{err}");
+        verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new().allow_unchecked_hashes(),
+        )
+        .unwrap();
+        verify_id_token(
+            &jwks,
+            &t,
+            "https://op.example.org",
+            "https://rp.example.com",
+            None,
+            &[es],
+            &[],
+        )
+        .unwrap();
         // Different access token: mismatch.
         assert!(verify_with(
             &jwks,
@@ -3559,8 +3608,16 @@ mod tests {
         });
         verify_with(&jwks, &t, es, &opts).unwrap();
         verify_with(&jwks, &t, es, &required).unwrap();
-        // Present without the option: not checked.
-        verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap();
+        // Present but nothing supplied to check it against: refused by default.
+        let err = verify_with(&jwks, &t, es, &IdTokenOptions::new()).unwrap_err();
+        assert!(err.to_string().contains("c_hash"), "{err}");
+        verify_with(
+            &jwks,
+            &t,
+            es,
+            &IdTokenOptions::new().allow_unchecked_hashes(),
+        )
+        .unwrap();
         // A different code does not match.
         assert!(verify_with(
             &jwks,
