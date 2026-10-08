@@ -283,7 +283,11 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
     if resp.status != 200 {
         return Err(upstream_error(
             UpstreamKind::Metadata,
-            format!("discovery failed ({}) for {url}", resp.status),
+            format!(
+                "discovery failed ({}) for {}",
+                resp.status,
+                display_safe(&url)
+            ),
             &resp,
         ));
     }
@@ -1508,6 +1512,9 @@ pub(crate) enum UpstreamKind {
 /// `error` (RFC 6749 §5.2); otherwise from the `WWW-Authenticate` header.
 /// `message` is the bare text; the `Display` prefix and the `auth_failure`
 /// flag both derive from `kind`, so they cannot drift apart.
+/// Longest `UpstreamHttpError` message, in characters, before truncation.
+const MAX_UPSTREAM_MESSAGE_CHARS: usize = 1024;
+
 pub(crate) fn upstream_error(
     kind: UpstreamKind,
     message: impl std::fmt::Display,
@@ -1517,7 +1524,13 @@ pub(crate) fn upstream_error(
         UpstreamKind::Auth => ("authentication error: ", true),
         UpstreamKind::Metadata => ("internal error: ", false),
     };
-    let message = format!("{prefix}{message}");
+    // Safety net: whatever the caller interpolated, the message (printed by
+    // both Display and Debug) stays bounded.
+    let mut message = format!("{prefix}{message}");
+    if let Some((end, _)) = message.char_indices().nth(MAX_UPSTREAM_MESSAGE_CHARS) {
+        message.truncate(end);
+        message.push('…');
+    }
     let mut error = None;
     let mut description = None;
     if let Ok(serde_json::Value::Object(obj)) =
@@ -2256,6 +2269,36 @@ mod tests {
         fetch_userinfo_response(&http, UI_URL, "at", UI_ISS, UserinfoMethod::Post)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_issuer_urls_do_not_make_unbounded_discovery_errors() {
+        let long = "p".repeat(5000);
+        let issuer = format!("https://op.example.com/{long}");
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(404, "")),
+            post: None,
+        });
+        let err = discover(&http, &issuer).await.unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            shown.starts_with("internal error: discovery failed (404) for https://op.example.com/")
+        );
+        assert!(shown.chars().count() < 400, "{}", shown.chars().count());
+        assert!(!shown.contains(&"p".repeat(300)));
+        let dbg = format!("{err:?}");
+        assert!(dbg.chars().count() < 800, "{}", dbg.chars().count());
+        assert_eq!(err.upstream_http().unwrap().status, Some(404));
+
+        // The generic cap bounds any message that slips through un-sanitized.
+        let resp = crate::http::HttpFetchResponse::new(500, "");
+        let err = upstream_error(UpstreamKind::Metadata, "x".repeat(5000), &resp);
+        let shown = err.to_string();
+        assert_eq!(shown.chars().count(), MAX_UPSTREAM_MESSAGE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        // A short message is untouched.
+        let err = upstream_error(UpstreamKind::Metadata, "short", &resp);
+        assert_eq!(err.to_string(), "internal error: short");
     }
 
     #[tokio::test]
