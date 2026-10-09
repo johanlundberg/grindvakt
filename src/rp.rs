@@ -916,14 +916,16 @@ pub fn verify_id_token_with(
     // OIDC Core §10.1 requires `kid` when the JWK Set has several keys. Without
     // it jose-rs tries every key, so a token signed by any key in the set would
     // verify. A single-key set needs no `kid` (it is optional in RFC 7515).
+    let kid = jwt::peek_header(id_token)?.kid;
     if jwks.keys.len() > 1 {
-        if jwt::peek_header(id_token)?.kid.is_none() {
+        if kid.is_none() {
             return Err(Error::Authn(
                 "id_token has no kid but the JWK Set has several keys".into(),
             ));
         }
         validation = validation.require_kid();
     }
+    ensure_kid_names_key(jwks, kid.as_deref(), "id_token")?;
     let claims = jwt::verify_with_jwks(jwks, id_token, &validation)?;
 
     if claims.sub.as_deref().is_none_or(str::is_empty) {
@@ -1156,13 +1158,15 @@ pub fn userinfo_signed_claims(
     // `kid` is only tolerated, on request, for a single-key set, where there is
     // nothing to be ambiguous about and the spec does not require it.
     let require_kid = jwks.keys.len() > 1 || !options.allow_missing_kid;
-    if require_kid && jwt::peek_header(token.trim())?.kid.is_none() {
+    let kid = jwt::peek_header(token.trim())?.kid;
+    if require_kid && kid.is_none() {
         return Err(Error::Authn(if jwks.keys.len() > 1 {
             "signed userinfo has no kid but the JWK Set has several keys".into()
         } else {
             "signed userinfo has no kid; use UserinfoJwtOptions::allow_missing_kid for an OP that publishes a single key without kid".into()
         }));
     }
+    ensure_kid_names_key(jwks, kid.as_deref(), "signed userinfo")?;
     let mut validation = Validation::new()
         .with_issuer(issuer)
         .with_audience(client_id)
@@ -1643,6 +1647,21 @@ pub fn claims_to_attributes(claims: &serde_json::Value) -> BTreeMap<String, Vec<
         }
     }
     out
+}
+
+/// Reject a token whose `kid` names no key in `jwks`.
+///
+/// jose-rs `require_kid` only checks that the header carries a `kid`. When no
+/// JWK has a `kid` it still tries every key, so `kid = "nonexistent"` would
+/// verify against an unlabelled key. A token without `kid` passes here; callers
+/// decide whether that is allowed.
+fn ensure_kid_names_key(jwks: &JwkSet, kid: Option<&str>, what: &str) -> Result<()> {
+    match kid {
+        Some(kid) if !jwks.keys.iter().any(|key| key.kid.as_deref() == Some(kid)) => Err(
+            Error::Authn(format!("{what} kid does not name a key in the JWK Set")),
+        ),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -3365,6 +3384,68 @@ mod tests {
             &[],
             options,
         )
+    }
+
+    #[test]
+    fn id_token_kid_must_name_a_key_in_the_set() {
+        // Signer labels the token "nonexistent"; the published keys carry no kid.
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let forger =
+            signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some("nonexistent"))
+                .unwrap();
+        let (token, mut single) = opts_token(&forger, |_| {});
+        assert_eq!(
+            jwt::peek_header(&token).unwrap().kid.as_deref(),
+            Some("nonexistent")
+        );
+        for k in &mut single.keys {
+            k.kid = None;
+        }
+        let es = JwsAlgorithm::ES256;
+        let err = verify_with(&single, &token, es, &IdTokenOptions::new()).unwrap_err();
+        assert!(err.to_string().contains("does not name a key"), "{err}");
+
+        let (_c, _p, other) = client_and_provider();
+        let mut mixed = other.to_public_jwks();
+        mixed.keys.extend(single.keys.clone());
+        let err = verify_with(&mixed, &token, es, &IdTokenOptions::new()).unwrap_err();
+        assert!(err.to_string().contains("does not name a key"), "{err}");
+    }
+
+    #[test]
+    fn userinfo_kid_must_name_a_key_in_the_set() {
+        let mut jwk = jose_rs::jwk::generate_ec("P-256").unwrap();
+        jwk.alg = Some("ES256".into());
+        let forger =
+            signing_key_from_jwk_json(&jwk.to_json().unwrap(), Some("ES256"), Some("nonexistent"))
+                .unwrap();
+        let c = Claims {
+            iss: Some("https://op.example.org".into()),
+            sub: Some("subject".into()),
+            aud: Some(Audience::Single("https://rp.example.com".into())),
+            iat: Some(now_secs()),
+            ..Default::default()
+        };
+        let token = jwt::sign(&forger, &c, Some("userinfo+jwt")).unwrap();
+        let resp = crate::http::HttpFetchResponse::new(200, token)
+            .with_header("Content-Type", "application/jwt");
+        let mut single = forger.to_public_jwks();
+        for k in &mut single.keys {
+            k.kid = None;
+        }
+        let (_c, _p, other) = client_and_provider();
+        let mut mixed = other.to_public_jwks();
+        mixed.keys.extend(single.keys.clone());
+        for jwks in [&single, &mixed] {
+            for o in all_modes() {
+                let err = run_userinfo(&resp, jwks, &o).unwrap_err();
+                assert!(err.to_string().contains("does not name a key"), "{err}");
+            }
+            // Opting out of the kid requirement does not skip the match.
+            let o = UserinfoJwtOptions::dedicated_keys().allow_missing_kid();
+            assert!(run_userinfo(&resp, jwks, &o).is_err());
+        }
     }
 
     #[test]
