@@ -523,7 +523,30 @@ impl Provider {
         acr: Option<String>,
         extra_claims: &BTreeMap<String, serde_json::Value>,
     ) -> Result<crate::http::Response, OAuthError> {
-        self.authorization_redirect_with_claims_and_subject_resolver(
+        self.authorization_redirect_with_auth_time(
+            req,
+            sub,
+            external_claims,
+            acr,
+            extra_claims,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::authorization_redirect_with_claims`], with an original
+    /// authentication time in Unix seconds (`None` uses issuance time).
+    /// Precomputed subjects are accepted only for public-subject clients.
+    pub async fn authorization_redirect_with_auth_time(
+        &self,
+        req: &AuthorizationRequest,
+        sub: &str,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+        extra_claims: &BTreeMap<String, serde_json::Value>,
+        auth_time: Option<u64>,
+    ) -> Result<crate::http::Response, OAuthError> {
+        self.authorization_redirect_with_claims_subject_resolver_and_auth_time(
             req,
             |client| {
                 // A precomputed subject is not bound to the registration that
@@ -540,6 +563,7 @@ impl Provider {
             external_claims,
             acr,
             extra_claims,
+            auth_time,
         )
         .await
     }
@@ -591,6 +615,33 @@ impl Provider {
     where
         F: FnOnce(&Client) -> Result<String, OAuthError>,
     {
+        self.authorization_redirect_with_claims_subject_resolver_and_auth_time(
+            req,
+            resolve_subject,
+            external_claims,
+            acr,
+            extra_claims,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::authorization_redirect_with_claims_and_subject_resolver`], with
+    /// an original authentication time in Unix seconds (`None` uses issuance time).
+    /// The resolver must select the subject using its supplied [`Client`], as
+    /// required by [`Self::authorization_redirect_with_subject_resolver`].
+    pub async fn authorization_redirect_with_claims_subject_resolver_and_auth_time<F>(
+        &self,
+        req: &AuthorizationRequest,
+        resolve_subject: F,
+        external_claims: &BTreeMap<String, Vec<String>>,
+        acr: Option<String>,
+        extra_claims: &BTreeMap<String, serde_json::Value>,
+        auth_time: Option<u64>,
+    ) -> Result<crate::http::Response, OAuthError>
+    where
+        F: FnOnce(&Client) -> Result<String, OAuthError>,
+    {
         // Revalidate serialized requests at the minting boundary and resolve
         // against this exact snapshot, rather than a client from before login.
         let client = self.validate_authorization_request(req).await?;
@@ -629,7 +680,7 @@ impl Provider {
             .with_state(req.state.clone()));
         }
         // No further lookups reinterpret the subject under another registration.
-        self.mint_authorization_response(req, &sub, external_claims, acr, extra_claims)
+        self.mint_authorization_response(req, &sub, external_claims, acr, extra_claims, auth_time)
     }
 
     fn mint_authorization_response(
@@ -639,6 +690,7 @@ impl Provider {
         external_claims: &BTreeMap<String, Vec<String>>,
         acr: Option<String>,
         extra_claims: &BTreeMap<String, serde_json::Value>,
+        auth_time: Option<u64>,
     ) -> Result<crate::http::Response, OAuthError> {
         if sub.is_empty() {
             return Err(OAuthError::new(
@@ -656,7 +708,8 @@ impl Provider {
                 claims.insert(k.clone(), v.clone());
             }
         }
-        let auth_time = now_secs();
+        let now = now_secs();
+        let auth_time = auth_time.unwrap_or(now);
         let mut out: Vec<(String, String)> = Vec::new();
 
         let access_token = if req.wants_access_token() {
@@ -665,7 +718,7 @@ impl Provider {
                 sub: sub.to_string(),
                 scope: req.scope.clone(),
                 claims: claims.clone(),
-                exp: auth_time + self.lifetimes.access_token_ttl,
+                exp: now + self.lifetimes.access_token_ttl,
                 cnf_jkt: None,
             };
             Some(
@@ -688,7 +741,7 @@ impl Provider {
                 code_challenge_method: req.code_challenge_method.clone(),
                 claims: claims.clone(),
                 auth_time,
-                exp: now_secs() + self.lifetimes.code_ttl,
+                exp: now + self.lifetimes.code_ttl,
                 acr: acr.clone(),
             };
             let code = self
