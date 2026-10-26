@@ -2318,6 +2318,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
     let op = provider_with(InMemoryClientStore::with_clients(clients))
         .with_caller_managed_pairwise_subjects();
     let jwks = op.jwks_document();
+    let auth_time = grindvakt::util::now_secs() - 86_400;
     for (client_id, _, subject) in identities {
         // Inspect verified ID-token claims, binding the signature check to the
         // expected issuer and recipient as well as checking the subject value.
@@ -2327,6 +2328,8 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
         let assert_id_subject = |token: &str| {
             let claims = jose_rs::jwt::decode_with_jwkset(&jwks, token, &validation).unwrap();
             assert_eq!(claims.sub.as_deref(), Some(subject));
+            assert_eq!(claims.extra["auth_time"], serde_json::json!(auth_time));
+            assert!(claims.iat.unwrap() > auth_time);
         };
         // Code flow checks deferred issuance; implicit flow checks direct ID
         // tokens; hybrid flow checks all three authorization artifacts together.
@@ -2336,7 +2339,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
             let released = BTreeMap::from([("sub".into(), vec!["wrong-subject".into()])]);
             let extra = BTreeMap::from([("sub".into(), serde_json::json!("also-wrong"))]);
             let response = op
-                .authorization_redirect_with_claims_and_subject_resolver(
+                .authorization_redirect_with_claims_subject_resolver_and_auth_time(
                     &req,
                     |client| {
                         // Select the existing mapping using the issuance snapshot,
@@ -2351,6 +2354,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
                     &released,
                     None,
                     &extra,
+                    Some(auth_time),
                 )
                 .await
                 .unwrap();
@@ -2378,6 +2382,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
             // client-authenticated token endpoint, not a direct token builder.
             let code = extract_param(location, "code").unwrap();
             assert_eq!(op.codec.open_code(&code).unwrap().sub, subject);
+            assert_eq!(op.codec.open_code(&code).unwrap().auth_time, auth_time);
             let mut tokens = op
                 .handle_token_request(
                     &pairs(&[
@@ -2411,6 +2416,10 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
                 );
                 let refresh = tokens.refresh_token.as_deref().unwrap();
                 assert_eq!(op.codec.open_refresh_token(refresh).unwrap().sub, subject);
+                assert_eq!(
+                    op.codec.open_refresh_token(refresh).unwrap().auth_time,
+                    auth_time
+                );
                 if round < 2 {
                     tokens = op
                         .handle_token_request(
@@ -2432,7 +2441,7 @@ async fn caller_managed_subjects_survive_all_artifact_paths() {
     }
 }
 
-/// Reject precomputed subjects for pairwise clients through both legacy APIs,
+/// Reject precomputed subjects for pairwise clients through all string-subject APIs,
 /// including when a registration changed after an earlier public validation.
 #[tokio::test]
 async fn precomputed_subjects_cannot_be_reinterpreted_as_pairwise() {
@@ -2444,8 +2453,28 @@ async fn precomputed_subjects_cannot_be_reinterpreted_as_pairwise() {
     let req = subject_request("changing-rp", "code");
     let earlier = op.validate_authorization_request(&req).await.unwrap();
     assert_eq!(earlier.subject_type, "public");
+    let auth_time = grindvakt::util::now_secs() - 86_400;
+    let response = op
+        .authorization_redirect_with_auth_time(
+            &req,
+            "public-subject",
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+            Some(auth_time),
+        )
+        .await
+        .unwrap();
+    let location = &response
+        .headers
+        .iter()
+        .find(|(name, _)| name == "location")
+        .unwrap()
+        .1;
+    let code = extract_param(location, "code").unwrap();
+    assert_eq!(op.codec.open_code(&code).unwrap().auth_time, auth_time);
     // Registration replacement can happen across the interactive login step.
-    // Neither string-subject API may apply the new policy to the old subject.
+    // No string-subject API may apply the new policy to the old subject.
     op.clients
         .put(subject_client("changing-rp", "pairwise"))
         .await;
@@ -2461,6 +2490,16 @@ async fn precomputed_subjects_cannot_be_reinterpreted_as_pairwise() {
                 &BTreeMap::new(),
                 None,
                 &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err(),
+            op.authorization_redirect_with_auth_time(
+                &req,
+                "public-subject",
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+                Some(auth_time),
             )
             .await
             .unwrap_err(),
