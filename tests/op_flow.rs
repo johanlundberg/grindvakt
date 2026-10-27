@@ -2907,7 +2907,10 @@ async fn authorization_error_redirect_carries_iss_when_opted_in() {
     let err =
         OAuthError::bare(OAuthErrorCode::AccessDenied).with_state(Some("x&iss=evil".to_string()));
     for (rt, frag) in [("code", false), ("code id_token", true)] {
-        let loc = location_of(&op.authorization_error_redirect(&iss_request(rt), &err));
+        let loc = location_of(
+            &op.authorization_error_redirect(&iss_request(rt), &err)
+                .unwrap(),
+        );
         assert_eq!(loc.contains('#'), frag, "{loc}");
         assert_single_iss(&loc);
         assert!(loc.contains("error=access_denied"), "{loc}");
@@ -2929,7 +2932,10 @@ async fn authorization_response_has_no_iss_without_opt_in() {
     assert!(iss.is_empty(), "{loc}");
 
     let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
-    let loc = location_of(&op.authorization_error_redirect(&iss_request("code"), &err));
+    let loc = location_of(
+        &op.authorization_error_redirect(&iss_request("code"), &err)
+            .unwrap(),
+    );
     assert!(!loc.contains("iss="), "{loc}");
     assert_eq!(
         loc,
@@ -2939,4 +2945,99 @@ async fn authorization_response_has_no_iss_without_opt_in() {
         .discovery_document()
         .get("authorization_response_iss_parameter_supported")
         .is_none());
+}
+
+fn iss_collision_op(opt_in: bool) -> Provider {
+    let mut c = iss_client();
+    c.redirect_uris = ["?iss=old", "?%69ss=old", "?a=b", "?x=1&iss=old"]
+        .iter()
+        .map(|q| format!("https://rp.example.com/cb{q}"))
+        .collect();
+    let op = provider_with(InMemoryClientStore::with_clients(vec![c]));
+    if opt_in {
+        op.with_authorization_response_iss()
+    } else {
+        op
+    }
+}
+
+fn iss_collision_request(
+    response_type: &str,
+    query: &str,
+    mode: Option<&str>,
+) -> AuthorizationRequest {
+    let uri = format!("https://rp.example.com/cb{query}");
+    let mut p = vec![
+        ("client_id", "rp-iss"),
+        ("response_type", response_type),
+        ("redirect_uri", uri.as_str()),
+        ("scope", "openid"),
+        ("nonce", "n-1"),
+    ];
+    if let Some(m) = mode {
+        p.push(("response_mode", m));
+    }
+    AuthorizationRequest::from_pairs(&pairs(&p)).unwrap()
+}
+
+#[tokio::test]
+async fn iss_collision_rejected_when_opted_in() {
+    let op = iss_collision_op(true);
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    for q in ["?iss=old", "?%69ss=old"] {
+        let req = iss_collision_request("code", q, None);
+        let e = op
+            .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, OAuthErrorCode::ServerError, "{q}");
+        assert!(!e.to_string().contains("old"), "{q}");
+        let e = op.authorization_error_redirect(&req, &err).unwrap_err();
+        assert_eq!(e.code, OAuthErrorCode::ServerError, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn iss_collision_allows_other_params_and_fragment_mode() {
+    let op = iss_collision_op(true);
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    let req = iss_collision_request("code", "?a=b", None);
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert_single_iss(&loc);
+    assert_eq!(extract_param(&loc, "a").as_deref(), Some("b"));
+    assert_single_iss(&location_of(
+        &op.authorization_error_redirect(&req, &err).unwrap(),
+    ));
+
+    let req = iss_collision_request("code", "?iss=old", Some("fragment"));
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert!(loc.contains("#"), "{loc}");
+    assert!(loc.contains("?iss=old#"), "{loc}");
+    assert!(op.authorization_error_redirect(&req, &err).is_ok());
+}
+
+#[tokio::test]
+async fn iss_collision_ignored_without_opt_in() {
+    let op = iss_collision_op(false);
+    let req = iss_collision_request("code", "?iss=old", None);
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        loc.starts_with("https://rp.example.com/cb?iss=old&"),
+        "{loc}"
+    );
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    let loc = location_of(&op.authorization_error_redirect(&req, &err).unwrap());
+    assert!(loc.contains("iss=old"), "{loc}");
 }

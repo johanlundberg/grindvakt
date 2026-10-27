@@ -25,7 +25,8 @@
   parameter (RFC 9207) to authorization responses, advertises
   `authorization_response_iss_parameter_supported`, and
   `Provider::authorization_error_redirect` builds error redirects that carry
-  `iss`. Without it the Provider behaves as before.
+  `iss`. With it enabled, a query-mode `redirect_uri` that already has an
+  `iss` parameter is refused (`server_error`) instead of producing a duplicate. Without it the Provider behaves as before.
 
 ## 0.9.0 [2026-10-09]
 
