@@ -72,7 +72,7 @@ pub use keys::{signing_key_from_pkcs11, Pkcs11KeyConfig};
 pub use callback::{
     parse_authorization_response, parse_authorization_response_multi,
     parse_authorization_response_request, parse_authorization_response_str, AuthorizationResponse,
-    AuthorizationResponseOptions, JarmOptions, ResponseMode, JARM_ASYMMETRIC_ALGORITHMS,
+    AuthorizationResponseOptions, JarmOptions, ResponseMode, JARM_ASYMMETRIC_ALGORITHMS, JARM_TYP,
 };
 pub use client::{Client, ClientStore, InMemoryClientStore};
 pub use dpop::{DpopConfig, DpopError, DpopProof, NoReplayStore, ReplayStore};

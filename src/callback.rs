@@ -249,8 +249,27 @@ impl AuthorizationResponse {
     /// Verify a JARM response and return the inner authorization response
     /// (mode [`ResponseMode::Jwt`], [`jarm_verified`](Self::jarm_verified)).
     ///
+    /// # Token substitution
+    ///
+    /// A JARM response is a JWT signed with the OP's keys, and those keys
+    /// often also sign ID tokens (and other JWTs). Without a purpose check, an
+    /// attacker holding any such token with matching `iss`/`aud`/`exp` and
+    /// string `code`/`state`/`error` claims could pass it off as an
+    /// authorization response. The JOSE `typ` header (RFC 8725 §3.11) is what
+    /// separates them, so by default the response must carry
+    /// [`JarmOptions::with_expected_typ`] (default `oauth-authz-resp`,
+    /// compared case-insensitively, with or without the `application/`
+    /// prefix). A present `typ` that differs (`at+jwt`, `id_token+jwt`, ...)
+    /// is always `Error::Authn`, and so is a missing one unless you opted in
+    /// with [`JarmOptions::with_dedicated_keys`] (the keys sign only JARM) or
+    /// [`JarmOptions::allow_untyped_shared_keys`] (compatibility with OPs that
+    /// send no `typ`; weaker, since an untyped ID token is then
+    /// indistinguishable). With either opt-in a `typ` of exactly `JWT` is
+    /// also tolerated.
+    ///
     /// Requires a signed JWT (JWE is `BadRequest`), a non-empty algorithm
-    /// list, a `kid` naming a key when the set has several, `iss` equal to
+    /// list, the `typ` rule above, a `kid` naming a key when the set has
+    /// several, `iss` equal to
     /// `opts` issuer, `aud` exactly the client id (a multi-valued `aud` is
     /// rejected) and `exp`. The inner parameters must be strings and pass
     /// the same shape rules as a plain callback. Signature / claim failures
@@ -290,6 +309,8 @@ impl AuthorizationResponse {
         }
         let header =
             jwt::peek_header(token).map_err(|_| bad("JARM response header is malformed"))?;
+        // Purpose check first and independent of claims: fail closed.
+        check_jarm_typ(header.typ.as_deref(), opts)?;
         let mut validation = Validation::new()
             .with_issuer(opts.issuer)
             .with_audience(opts.client_id)
@@ -362,9 +383,46 @@ pub const JARM_ASYMMETRIC_ALGORITHMS: &[JwsAlgorithm] = &[
     JwsAlgorithm::EdDSA,
 ];
 
+/// Default JOSE `typ` required of a JARM response (see
+/// [`JarmOptions::with_expected_typ`]).
+pub const JARM_TYP: &str = "oauth-authz-resp";
+
+/// Normalize a `typ` for comparison: case-insensitive, leading
+/// `application/` removed (RFC 7515 §4.1.9).
+fn norm_typ(typ: &str) -> String {
+    let t = typ.to_ascii_lowercase();
+    t.strip_prefix("application/").unwrap_or(&t).to_string()
+}
+
+/// The JARM `typ` rule; see [`AuthorizationResponse::verify_jarm`].
+fn check_jarm_typ(typ: Option<&str>, opts: &JarmOptions<'_>) -> Result<()> {
+    match typ {
+        Some(t) => {
+            let t = norm_typ(t);
+            if t == norm_typ(opts.expected_typ) || (opts.allow_missing_typ && t == "jwt") {
+                Ok(())
+            } else {
+                Err(Error::Authn(
+                    "JARM response typ header does not identify a JARM response".into(),
+                ))
+            }
+        }
+        None if opts.allow_missing_typ => Ok(()),
+        None => Err(Error::Authn(
+            "JARM response has no typ header (see JarmOptions::with_dedicated_keys / \
+             allow_untyped_shared_keys)"
+                .into(),
+        )),
+    }
+}
+
 /// Options for [`AuthorizationResponse::verify_jarm`].
 ///
-/// `#[non_exhaustive]`: build with [`JarmOptions::new`].
+/// `#[non_exhaustive]`: build with [`JarmOptions::new`]. By default the
+/// response must carry the JOSE `typ` [`JARM_TYP`] (`oauth-authz-resp`),
+/// which stops other JWTs signed by the same OP keys (ID tokens, access
+/// tokens) being replayed as an authorization response. See
+/// [`AuthorizationResponse::verify_jarm`] for the threat and the rules.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct JarmOptions<'a> {
@@ -372,6 +430,8 @@ pub struct JarmOptions<'a> {
     client_id: &'a str,
     allowed_algorithms: &'a [JwsAlgorithm],
     leeway: Option<u64>,
+    expected_typ: &'a str,
+    allow_missing_typ: bool,
 }
 
 impl<'a> JarmOptions<'a> {
@@ -387,7 +447,35 @@ impl<'a> JarmOptions<'a> {
             client_id,
             allowed_algorithms,
             leeway: None,
+            expected_typ: JARM_TYP,
+            allow_missing_typ: false,
         }
+    }
+
+    /// Required JOSE `typ` (default [`JARM_TYP`]). Compared
+    /// case-insensitively; the `application/` prefix form is accepted.
+    pub fn with_expected_typ(mut self, typ: &'a str) -> Self {
+        self.expected_typ = typ;
+        self
+    }
+
+    /// Assert that the keys in the `JwkSet` sign only JARM responses, so a
+    /// token that verifies cannot be another kind of JWT. Permits a MISSING
+    /// `typ` (and `typ` `JWT`); any other mismatching `typ` is still
+    /// rejected. Only use this when you truly control or know the key usage.
+    pub fn with_dedicated_keys(mut self) -> Self {
+        self.allow_missing_typ = true;
+        self
+    }
+
+    /// Compatibility opt-in for OPs that send no `typ` while sharing keys
+    /// with ID tokens. Permits a MISSING `typ` (and `typ` `JWT`); any other
+    /// mismatching `typ` (`at+jwt`, `id_token+jwt`, ...) is still rejected.
+    /// WEAKER: an untyped ID token with string `code`/`state` claims is
+    /// accepted, so prefer the default.
+    pub fn allow_untyped_shared_keys(mut self) -> Self {
+        self.allow_missing_typ = true;
+        self
     }
 
     /// Clock-skew tolerance in seconds (at most [`MAX_ID_TOKEN_LEEWAY`];
@@ -691,6 +779,7 @@ mod tests {
 
     const ISS: &str = "https://op.example.org";
     const CLIENT: &str = "https://rp.example.com";
+    const TYP: &str = JARM_TYP;
     const ES: [JwsAlgorithm; 1] = [JwsAlgorithm::ES256];
 
     fn p(pairs: &[(&str, &str)]) -> Result<AuthorizationResponse> {
@@ -1027,7 +1116,7 @@ mod tests {
     #[test]
     fn jarm_valid() {
         let k = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         let r = verify(&t, &k.to_public_jwks(), &ES).unwrap();
         assert_eq!(r.code(), Some("the-code"));
         assert_eq!(r.iss(), Some(ISS));
@@ -1043,7 +1132,7 @@ mod tests {
                 c.extra
                     .insert("error_description".into(), "no\u{1b}".into());
             }),
-            None,
+            Some(TYP),
         )
         .unwrap();
         let r = verify(&t, &k.to_public_jwks(), &ES).unwrap();
@@ -1063,7 +1152,7 @@ mod tests {
         let t = jwt::sign(
             &k,
             &jarm_claims(|c| c.iss = Some("https://evil".into())),
-            None,
+            Some(TYP),
         )
         .unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
@@ -1075,7 +1164,7 @@ mod tests {
         let t = jwt::sign(
             &k,
             &jarm_claims(|c| c.aud = Some(Audience::Single("other".into()))),
-            None,
+            Some(TYP),
         )
         .unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
@@ -1087,14 +1176,14 @@ mod tests {
         let t = jwt::sign(
             &k,
             &jarm_claims(|c| c.aud = Some(Audience::Multiple(vec![CLIENT.into(), "other".into()]))),
-            None,
+            Some(TYP),
         )
         .unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
         let t = jwt::sign(
             &k,
             &jarm_claims(|c| c.aud = Some(Audience::Multiple(vec![CLIENT.into()]))),
-            None,
+            Some(TYP),
         )
         .unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
@@ -1103,16 +1192,21 @@ mod tests {
     #[test]
     fn jarm_expired_and_missing_exp() {
         let k = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|c| c.exp = Some(now_secs() - 3600)), None).unwrap();
+        let t = jwt::sign(
+            &k,
+            &jarm_claims(|c| c.exp = Some(now_secs() - 3600)),
+            Some(TYP),
+        )
+        .unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
-        let t = jwt::sign(&k, &jarm_claims(|c| c.exp = None), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|c| c.exp = None), Some(TYP)).unwrap();
         authn(verify(&t, &k.to_public_jwks(), &ES));
     }
 
     #[test]
     fn jarm_leeway_bounded() {
         let k = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         let j = k.to_public_jwks();
         let s = stub(&t).unwrap();
         is_bad(s.verify_jarm(
@@ -1130,7 +1224,7 @@ mod tests {
     #[test]
     fn jarm_algorithm_rules() {
         let k = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         authn(verify(&t, &k.to_public_jwks(), &[JwsAlgorithm::RS256]));
         is_bad(verify(&t, &k.to_public_jwks(), &[]));
     }
@@ -1138,7 +1232,7 @@ mod tests {
     #[test]
     fn jarm_empty_issuer_or_client_rejected() {
         let k = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|c| c.iss = Some(String::new())), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|c| c.iss = Some(String::new())), Some(TYP)).unwrap();
         let j = k.to_public_jwks();
         let s = stub(&t).unwrap();
         is_bad(s.verify_jarm(&j, &JarmOptions::new("", CLIENT, &ES)));
@@ -1152,17 +1246,17 @@ mod tests {
         let mut both = k1.to_public_jwks();
         both.keys.extend(k2.to_public_jwks().keys);
         // No kid, two keys.
-        let t = jwt::sign(&k1, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k1, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         authn(verify(&t, &both, &ES));
         // kid that names no key.
         let ghost = key(Some("ghost"));
-        let t = jwt::sign(&ghost, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&ghost, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         authn(verify(&t, &both, &ES));
         // Single unlabelled key, no kid: fine.
-        let t = jwt::sign(&k1, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k1, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         assert!(verify(&t, &k1.to_public_jwks(), &ES).is_ok());
         // Correct kid among two keys: fine.
-        let t = jwt::sign(&k2, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k2, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         assert!(verify(&t, &both, &ES).is_ok());
     }
 
@@ -1170,7 +1264,7 @@ mod tests {
     fn jarm_wrong_key() {
         let k = key(Some("k1"));
         let other = key(Some("k1"));
-        let t = jwt::sign(&k, &jarm_claims(|_| {}), None).unwrap();
+        let t = jwt::sign(&k, &jarm_claims(|_| {}), Some(TYP)).unwrap();
         authn(verify(&t, &other.to_public_jwks(), &ES));
     }
 
@@ -1178,8 +1272,9 @@ mod tests {
     fn jarm_inner_claims_must_be_strings_and_valid() {
         let k = key(Some("k1"));
         let j = k.to_public_jwks();
-        let sign =
-            |tweak: Box<dyn FnOnce(&mut Claims)>| jwt::sign(&k, &jarm_claims(tweak), None).unwrap();
+        let sign = |tweak: Box<dyn FnOnce(&mut Claims)>| {
+            jwt::sign(&k, &jarm_claims(tweak), Some(TYP)).unwrap()
+        };
         is_bad(verify(
             &sign(Box::new(|c| {
                 c.extra.insert("code".into(), 123.into());
@@ -1255,7 +1350,112 @@ mod tests {
         });
         c.sub = Some("subject".into());
         c.iat = Some(now_secs());
-        let t = jwt::sign(&k, &c, None).unwrap();
+        let t = jwt::sign(&k, &c, Some(TYP)).unwrap();
         is_bad(verify(&t, &k.to_public_jwks(), &ES));
+    }
+
+    /// Verify with the given option tweak.
+    fn verify_with(
+        token: &str,
+        k: &SigningKey,
+        f: impl FnOnce(JarmOptions<'static>) -> JarmOptions<'static>,
+    ) -> Result<AuthorizationResponse> {
+        stub(token)?.verify_jarm(&k.to_public_jwks(), &f(JarmOptions::new(ISS, CLIENT, &ES)))
+    }
+
+    fn error_claims() -> Claims {
+        jarm_claims(|c| {
+            c.extra.remove("code");
+            c.extra.insert("error".into(), "access_denied".into());
+        })
+    }
+
+    /// Tokens whose shape is a valid callback but whose purpose may differ.
+    fn both_shapes() -> [Claims; 2] {
+        [jarm_claims(|_| {}), error_claims()]
+    }
+
+    #[test]
+    fn jarm_id_token_shaped_substitution_rejected_by_default() {
+        let k = key(Some("k1"));
+        for mut c in both_shapes() {
+            c.sub = Some("subject".into());
+            c.iat = Some(now_secs());
+            for typ in [None, Some("JWT"), Some("at+jwt"), Some("id_token+jwt")] {
+                let t = jwt::sign(&k, &c, typ).unwrap();
+                authn(verify_with(&t, &k, |o| o));
+            }
+        }
+    }
+
+    #[test]
+    fn jarm_incompatible_typ_rejected_even_with_opt_in() {
+        let k = key(Some("k1"));
+        for c in both_shapes() {
+            for typ in [
+                "at+jwt",
+                "id_token+jwt",
+                "application/at+jwt",
+                "dpop+jwt",
+                "",
+            ] {
+                let t = jwt::sign(&k, &c, Some(typ)).unwrap();
+                authn(verify_with(&t, &k, |o| o.with_dedicated_keys()));
+                authn(verify_with(&t, &k, |o| o.allow_untyped_shared_keys()));
+                authn(verify_with(&t, &k, |o| o));
+            }
+        }
+    }
+
+    #[test]
+    fn jarm_correct_typ_accepted() {
+        let k = key(Some("k1"));
+        for c in both_shapes() {
+            for typ in [
+                "oauth-authz-resp",
+                "OAuth-Authz-Resp",
+                "application/oauth-authz-resp",
+            ] {
+                let t = jwt::sign(&k, &c, Some(typ)).unwrap();
+                verify_with(&t, &k, |o| o).unwrap();
+                verify_with(&t, &k, |o| o.with_dedicated_keys()).unwrap();
+                verify_with(&t, &k, |o| o.allow_untyped_shared_keys()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn jarm_custom_expected_typ() {
+        let k = key(Some("k1"));
+        let c = jarm_claims(|_| {});
+        let t = jwt::sign(&k, &c, Some("my-jarm")).unwrap();
+        verify_with(&t, &k, |o| o.with_expected_typ("My-JARM")).unwrap();
+        authn(verify_with(&t, &k, |o| o));
+        let t = jwt::sign(&k, &c, Some(TYP)).unwrap();
+        authn(verify_with(&t, &k, |o| o.with_expected_typ("my-jarm")));
+    }
+
+    #[test]
+    fn jarm_missing_typ_only_with_opt_in() {
+        let k = key(Some("k1"));
+        for c in both_shapes() {
+            let t = jwt::sign(&k, &c, None).unwrap();
+            authn(verify_with(&t, &k, |o| o));
+            verify_with(&t, &k, |o| o.with_dedicated_keys()).unwrap();
+            verify_with(&t, &k, |o| o.allow_untyped_shared_keys()).unwrap();
+        }
+    }
+
+    #[test]
+    fn jarm_typ_jwt_only_with_opt_in() {
+        let k = key(Some("k1"));
+        for c in both_shapes() {
+            for typ in ["JWT", "jwt", "application/jwt"] {
+                let t = jwt::sign(&k, &c, Some(typ)).unwrap();
+                authn(verify_with(&t, &k, |o| o));
+                verify_with(&t, &k, |o| o.with_dedicated_keys()).unwrap();
+                verify_with(&t, &k, |o| o.allow_untyped_shared_keys()).unwrap();
+            }
+        }
     }
 }
