@@ -257,7 +257,7 @@ impl AuthorizationResponse {
     /// string `code`/`state`/`error` claims could pass it off as an
     /// authorization response. The JOSE `typ` header (RFC 8725 §3.11) is what
     /// separates them, so by default the response must carry
-    /// [`JarmOptions::with_expected_typ`] (default `oauth-authz-resp`,
+    /// [`JarmOptions::with_expected_typ`] (default `oauth-authz-resp+jwt`,
     /// compared case-insensitively, with or without the `application/`
     /// prefix). A present `typ` that differs (`at+jwt`, `id_token+jwt`, ...)
     /// is always `Error::Authn`, and so is a missing one unless you opted in
@@ -384,8 +384,9 @@ pub const JARM_ASYMMETRIC_ALGORITHMS: &[JwsAlgorithm] = &[
 ];
 
 /// Default JOSE `typ` required of a JARM response (see
-/// [`JarmOptions::with_expected_typ`]).
-pub const JARM_TYP: &str = "oauth-authz-resp";
+/// [`JarmOptions::with_expected_typ`]): the short form of the JARM media
+/// type `application/oauth-authz-resp+jwt`. Both forms are accepted.
+pub const JARM_TYP: &str = "oauth-authz-resp+jwt";
 
 /// Normalize a `typ` for comparison: case-insensitive, leading
 /// `application/` removed (RFC 7515 §4.1.9).
@@ -419,7 +420,7 @@ fn check_jarm_typ(typ: Option<&str>, opts: &JarmOptions<'_>) -> Result<()> {
 /// Options for [`AuthorizationResponse::verify_jarm`].
 ///
 /// `#[non_exhaustive]`: build with [`JarmOptions::new`]. By default the
-/// response must carry the JOSE `typ` [`JARM_TYP`] (`oauth-authz-resp`),
+/// response must carry the JOSE `typ` [`JARM_TYP`] (`oauth-authz-resp+jwt`),
 /// which stops other JWTs signed by the same OP keys (ID tokens, access
 /// tokens) being replayed as an authorization response. See
 /// [`AuthorizationResponse::verify_jarm`] for the threat and the rules.
@@ -1409,14 +1410,28 @@ mod tests {
         let k = key(Some("k1"));
         for c in both_shapes() {
             for typ in [
-                "oauth-authz-resp",
-                "OAuth-Authz-Resp",
-                "application/oauth-authz-resp",
+                "oauth-authz-resp+jwt",
+                "OAuth-Authz-Resp+JWT",
+                "application/oauth-authz-resp+jwt",
             ] {
                 let t = jwt::sign(&k, &c, Some(typ)).unwrap();
                 verify_with(&t, &k, |o| o).unwrap();
                 verify_with(&t, &k, |o| o.with_dedicated_keys()).unwrap();
                 verify_with(&t, &k, |o| o.allow_untyped_shared_keys()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn jarm_bare_oauth_authz_resp_is_not_the_jarm_typ() {
+        let k = key(Some("k1"));
+        for c in both_shapes() {
+            for typ in ["oauth-authz-resp", "application/oauth-authz-resp"] {
+                let t = jwt::sign(&k, &c, Some(typ)).unwrap();
+                assert!(matches!(
+                    verify_with(&t, &k, |o| o.with_dedicated_keys()),
+                    Err(Error::Authn(_))
+                ));
             }
         }
     }

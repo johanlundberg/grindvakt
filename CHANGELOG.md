@@ -18,8 +18,8 @@
   `_request` variants) parse and validate authorization callbacks, including
   JARM, with `AuthorizationResponse::verify_jarm` for signed JARM responses.
   `JARM_ASYMMETRIC_ALGORITHMS` is the recommended allow-list for it (no
-  `HS*`). JARM responses must carry JOSE `typ` `oauth-authz-resp` by
-  default (`JarmOptions::with_expected_typ`); a missing `typ` needs the
+  `HS*`). JARM responses must carry JOSE `typ` `oauth-authz-resp+jwt` (or
+  `application/oauth-authz-resp+jwt`) by default (`JarmOptions::with_expected_typ`); a missing `typ` needs the
   opt-in `with_dedicated_keys` / `allow_untyped_shared_keys`.
 - New opt-in `Provider::with_authorization_response_iss` adds the `iss`
   parameter (RFC 9207) to authorization responses, advertises
