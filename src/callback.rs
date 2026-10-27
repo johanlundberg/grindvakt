@@ -846,9 +846,6 @@ mod tests {
                 let mut pairs = vec![("code", "ok")];
                 pairs.retain(|(k, _)| *k != name);
                 pairs.push((name, bad_val));
-                if name != "code" {
-                    pairs.push(("code", "ok"));
-                }
                 let err = p(&pairs).unwrap_err();
                 assert!(matches!(err, Error::BadRequest(_)));
                 let msg = err.to_string();
