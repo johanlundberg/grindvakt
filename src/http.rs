@@ -252,6 +252,33 @@ impl HttpFetchResponse {
         }
     }
 
+    /// The `Age` header (RFC 9111 §5.1) in seconds. Only a trimmed,
+    /// digits-only value counts, and the first `Age` header wins; a value too
+    /// large for `u64` saturates to `u64::MAX` ("very old") rather than being
+    /// ignored. `None` when absent or malformed.
+    pub fn age(&self) -> Option<u64> {
+        self.header("age")
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .map(|v| v.parse::<u64>().unwrap_or(u64::MAX))
+    }
+
+    /// Freshness lifetime advertised by `Cache-Control`, ignoring `Age` and
+    /// **not capped** (an upstream controls it). `Some(0)` for `no-store` or
+    /// `no-cache`; `None` when absent or without a usable `max-age`. Same
+    /// rules as `JwksResponse::advertised_ttl_secs`.
+    pub fn advertised_ttl_secs(&self) -> Option<u64> {
+        crate::rp::advertised_ttl(self.cache_control().as_deref())
+    }
+
+    /// Remaining freshness in seconds: the advertised lifetime minus
+    /// [`HttpFetchResponse::age`], saturating at 0, limited to `ceiling`.
+    /// `None` when `Cache-Control` gives no usable lifetime.
+    pub fn cache_ttl_secs_max(&self, ceiling: u64) -> Option<u64> {
+        self.advertised_ttl_secs()
+            .map(|ttl| ttl.saturating_sub(self.age().unwrap_or(0)).min(ceiling))
+    }
+
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
@@ -265,6 +292,27 @@ impl HttpFetchResponse {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn age_parsing() {
+        let r = |v: &str| HttpFetchResponse::new(200, "").with_header("Age", v).age();
+        assert_eq!(HttpFetchResponse::new(200, "").age(), None);
+        assert_eq!(r(" 60 "), Some(60));
+        assert_eq!(r("0"), Some(0));
+        assert_eq!(r("abc"), None);
+        assert_eq!(r("-1"), None);
+        assert_eq!(r("+1"), None);
+        assert_eq!(r(""), None);
+        assert_eq!(r("99999999999999999999999"), Some(u64::MAX));
+        let repeated = HttpFetchResponse::new(200, "")
+            .with_header("Age", "5")
+            .with_header("age", "9");
+        assert_eq!(repeated.age(), Some(5));
+        let bad_first = HttpFetchResponse::new(200, "")
+            .with_header("Age", "x")
+            .with_header("Age", "9");
+        assert_eq!(bad_first.age(), None);
+    }
 
     struct BasicClient;
 

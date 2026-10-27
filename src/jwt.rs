@@ -97,9 +97,57 @@ pub fn supports_oidc_token_hash(alg: JwsAlgorithm) -> bool {
     )
 }
 
+/// Every standard JWS signature algorithm that jose-rs can parse and that
+/// grindvakt may meet in the wild.
+///
+/// Excludes `none` and the feature-gated ML-DSA variants. `ES256K` is included
+/// because it parses, but kryptering cannot verify it. For asymmetric
+/// algorithms only, filter out those where [`is_symmetric_jws_algorithm`]
+/// returns true (the `HS*` family).
+///
+/// This is a catalogue, not a safe default allow-list: do not pass it as the
+/// allowed algorithms for verifying against a provider's JWK Set, where the
+/// `HS*` family invites key-confusion mistakes.
+pub const JWS_ALGORITHMS: &[JwsAlgorithm] = &[
+    JwsAlgorithm::HS256,
+    JwsAlgorithm::HS384,
+    JwsAlgorithm::HS512,
+    JwsAlgorithm::RS256,
+    JwsAlgorithm::RS384,
+    JwsAlgorithm::RS512,
+    JwsAlgorithm::PS256,
+    JwsAlgorithm::PS384,
+    JwsAlgorithm::PS512,
+    JwsAlgorithm::ES256,
+    JwsAlgorithm::ES384,
+    JwsAlgorithm::ES512,
+    JwsAlgorithm::EdDSA,
+    JwsAlgorithm::ES256K,
+];
+
+/// True for the HMAC (shared-secret) algorithms `HS256`, `HS384` and `HS512`.
+pub fn is_symmetric_jws_algorithm(alg: &JwsAlgorithm) -> bool {
+    matches!(
+        alg,
+        JwsAlgorithm::HS256 | JwsAlgorithm::HS384 | JwsAlgorithm::HS512
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jws_algorithms_list_is_well_formed() {
+        assert_eq!(JWS_ALGORITHMS.len(), 14);
+        for (i, a) in JWS_ALGORITHMS.iter().enumerate() {
+            assert!(!JWS_ALGORITHMS[i + 1..].contains(a), "duplicate {a}");
+            let name = a.to_string();
+            assert_ne!(name, "none");
+            assert_eq!(JwsAlgorithm::from_str(&name).unwrap(), *a);
+            assert_eq!(is_symmetric_jws_algorithm(a), name.starts_with("HS"));
+        }
+    }
 
     #[test]
     fn oidc_token_hash_matches_core_appendix_a_vectors() {

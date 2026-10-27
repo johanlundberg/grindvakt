@@ -129,6 +129,18 @@ impl UpstreamHttpError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Whether the upstream status suggests the exchange may succeed if
+    /// retried: any 5xx, or 429 Too Many Requests.
+    ///
+    /// Decided from the HTTP status only, never from upstream error text.
+    /// Transport errors (no status) cannot be classified and return `false`.
+    /// A `use_dpop_nonce` challenge is not covered: it needs a retry with the
+    /// supplied nonce, not a plain retry. A 200 response with an OAuth error
+    /// body returns `false`.
+    pub fn is_retryable(&self) -> bool {
+        self.status.is_some_and(|s| s >= 500 || s == 429)
+    }
 }
 
 impl std::fmt::Debug for UpstreamHttpError {
@@ -164,7 +176,12 @@ impl std::fmt::Display for UpstreamHttpError {
 /// something it is not. `char::is_control` does not cover these (they are
 /// category Cf, not Cc). Hand-maintained from Unicode general category Cf and
 /// Default_Ignorable_Code_Point, without pulling in a Unicode crate.
-pub(crate) fn is_invisible_format(c: char) -> bool {
+///
+/// ```
+/// assert!(grindvakt::is_invisible_format('\u{202E}'));
+/// assert!(!grindvakt::is_invisible_format('a'));
+/// ```
+pub fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
         // Bidirectional controls and Unicode line/paragraph separators.
@@ -193,13 +210,29 @@ pub(crate) fn is_invisible_format(c: char) -> bool {
 
 /// Make an attacker-controlled value safe to interpolate into an error
 /// message: escapes control and bidi formatting characters and caps length.
-pub(crate) fn display_safe(s: &str) -> String {
+///
+/// The output is capped at 256 characters; when the input is truncated a
+/// trailing `…` is appended. See [`escape_upstream_text`] for the escaping.
+///
+/// ```
+/// assert_eq!(grindvakt::display_safe("a\u{1b}b"), "a\\u{1b}b");
+/// assert_eq!(grindvakt::display_safe(&"x".repeat(300)).chars().count(), 257);
+/// ```
+pub fn display_safe(s: &str) -> String {
     escape_upstream_text(s, 256)
 }
 
 /// Escape control and bidi/format characters in untrusted upstream text and
 /// cap the output at `max_chars` characters (appending `…` when truncated).
-pub(crate) fn escape_upstream_text(s: &str, max_chars: usize) -> String {
+///
+/// An escape sequence (for example `\u{1b}`) is never split: if it does not
+/// fit within the cap, it is dropped whole and the output ends with `…`.
+///
+/// ```
+/// assert_eq!(grindvakt::escape_upstream_text("ab\u{1b}", 4), "ab…");
+/// assert_eq!(grindvakt::escape_upstream_text("ab\u{1b}", 8), "ab\\u{1b}");
+/// ```
+pub fn escape_upstream_text(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut count = 0usize;
     for c in s.chars() {
@@ -387,6 +420,14 @@ impl Error {
         }
     }
 
+    /// Whether this error is an [`Error::UpstreamHttp`] whose status suggests
+    /// a retry may succeed (5xx or 429). See
+    /// [`UpstreamHttpError::is_retryable`]; every other variant returns
+    /// `false`.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::UpstreamHttp(e) if e.is_retryable())
+    }
+
     /// Suggested HTTP status code for surfacing this error to a client.
     pub fn status_hint(&self) -> u16 {
         match self {
@@ -408,6 +449,54 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn upstream(status: Option<u16>) -> UpstreamHttpError {
+        UpstreamHttpError::new(status, None, None, None, "m".into(), false)
+    }
+
+    #[test]
+    fn is_retryable_by_status() {
+        for (status, want) in [
+            (Some(400), false),
+            (Some(401), false),
+            (Some(404), false),
+            (Some(429), true),
+            (Some(500), true),
+            (Some(502), true),
+            (Some(503), true),
+            (Some(599), true),
+            (None, false),
+        ] {
+            let e = upstream(status);
+            assert_eq!(e.is_retryable(), want, "{status:?}");
+            assert_eq!(
+                Error::UpstreamHttp(Box::new(e)).is_retryable(),
+                want,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_variants_not_retryable() {
+        let json_err = serde_json::from_str::<u8>("x").unwrap_err();
+        for e in [
+            Error::NoBoundEndpoint("x".into()),
+            Error::UnknownModule("x".into()),
+            Error::BadRequest("x".into()),
+            Error::Authn("x".into()),
+            Error::State("x".into()),
+            Error::Config("x".into()),
+            Error::Crypto("x".into()),
+            Error::Attribute("x".into()),
+            Error::Json(json_err),
+            Error::Internal("x".into()),
+        ] {
+            assert!(!e.is_retryable(), "{e:?}");
+        }
+    }
+
     #[test]
     fn upstream_http_error_debug_redacts_body() {
         let e = super::UpstreamHttpError::new(
@@ -432,8 +521,6 @@ mod tests {
             Some("rejected code SECRET-DESC")
         );
     }
-
-    use super::*;
 
     #[test]
     fn escape_controls_and_bidi() {

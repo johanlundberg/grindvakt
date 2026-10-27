@@ -42,6 +42,7 @@ pub mod mac;
 pub mod util;
 
 // --- OAuth2 / OIDC / Federation protocol ---
+pub mod callback;
 pub mod client;
 pub mod discovery;
 pub mod dpop;
@@ -60,6 +61,7 @@ pub mod tokens;
 pub use jose_rs;
 
 // Convenient root re-exports — primitives.
+pub use error::{display_safe, escape_upstream_text, is_invisible_format};
 pub use error::{Error, Result};
 pub use http::{HttpClient, HttpFetchResponse, HttpRequestData, Response};
 pub use keys::{signing_key_from_jwk_json, signing_key_from_pem, SigningKey};
@@ -67,10 +69,16 @@ pub use keys::{signing_key_from_jwk_json, signing_key_from_pem, SigningKey};
 pub use keys::{signing_key_from_pkcs11, Pkcs11KeyConfig};
 
 // Convenient root re-exports — protocol.
+pub use callback::{
+    parse_authorization_response, parse_authorization_response_multi,
+    parse_authorization_response_request, parse_authorization_response_str, AuthorizationResponse,
+    AuthorizationResponseOptions, JarmOptions, ResponseMode, JARM_ASYMMETRIC_ALGORITHMS,
+};
 pub use client::{Client, ClientStore, InMemoryClientStore};
 pub use dpop::{DpopConfig, DpopError, DpopProof, NoReplayStore, ReplayStore};
+pub use jwt::{is_symmetric_jws_algorithm, JWS_ALGORITHMS};
 pub use metadata::ProviderMetadata;
-pub use oauth_error::{OAuthError, OAuthErrorCode};
+pub use oauth_error::{OAuthError, OAuthErrorCode, ParseOAuthErrorCodeError};
 #[cfg(feature = "redis")]
 pub use provider::RedisStore;
 pub use provider::{InMemoryTokenUseStore, Provider, TokenLifetimes, TokenResponse, TokenUseStore};

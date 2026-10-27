@@ -51,6 +51,46 @@ impl OAuthErrorCode {
     }
 }
 
+/// Error returned when a string is not one of the [`OAuthErrorCode`] values.
+///
+/// The message does not echo the rejected input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseOAuthErrorCodeError {
+    _private: (),
+}
+
+impl std::fmt::Display for ParseOAuthErrorCodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unrecognized OAuth error code")
+    }
+}
+
+impl std::error::Error for ParseOAuthErrorCodeError {}
+
+impl std::str::FromStr for OAuthErrorCode {
+    type Err = ParseOAuthErrorCodeError;
+
+    /// Exact, case-sensitive match on the [`OAuthErrorCode::as_str`] values.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "invalid_request" => Self::InvalidRequest,
+            "invalid_client" => Self::InvalidClient,
+            "invalid_grant" => Self::InvalidGrant,
+            "unauthorized_client" => Self::UnauthorizedClient,
+            "unsupported_grant_type" => Self::UnsupportedGrantType,
+            "unsupported_response_type" => Self::UnsupportedResponseType,
+            "invalid_scope" => Self::InvalidScope,
+            "access_denied" => Self::AccessDenied,
+            "login_required" => Self::LoginRequired,
+            "server_error" => Self::ServerError,
+            "temporarily_unavailable" => Self::TemporarilyUnavailable,
+            "invalid_dpop_proof" => Self::InvalidDpopProof,
+            _ => return Err(ParseOAuthErrorCodeError { _private: () }),
+        })
+    }
+}
+
 /// Longest `error_description` put on the wire, in characters.
 const MAX_WIRE_DESCRIPTION_CHARS: usize = 256;
 
@@ -171,6 +211,17 @@ impl OAuthError {
     /// response mode. `fragment` must come from the validated authorization
     /// request and must match the corresponding successful response mode.
     pub fn to_redirect(&self, redirect_uri: &str, fragment: bool) -> Response {
+        self.to_redirect_with_params(redirect_uri, fragment, &[])
+    }
+
+    /// [`Self::to_redirect`] with additional parameters appended after the
+    /// standard ones. Output is identical when `extra` is empty.
+    pub(crate) fn to_redirect_with_params(
+        &self,
+        redirect_uri: &str,
+        fragment: bool,
+        extra: &[(&str, &str)],
+    ) -> Response {
         let description = self.description.as_deref().map(wire_description);
         let mut params = vec![("error", self.code.as_str())];
         if let Some(desc) = description.as_deref() {
@@ -179,6 +230,7 @@ impl OAuthError {
         if let Some(state) = self.wire_state() {
             params.push(("state", state));
         }
+        params.extend_from_slice(extra);
         let encoded = params
             .iter()
             .map(|(name, value)| format!("{}={}", urlencode(name), urlencode(value)))
@@ -220,6 +272,71 @@ pub(crate) fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const ALL_CODES: [OAuthErrorCode; 12] = [
+        OAuthErrorCode::InvalidRequest,
+        OAuthErrorCode::InvalidClient,
+        OAuthErrorCode::InvalidGrant,
+        OAuthErrorCode::UnauthorizedClient,
+        OAuthErrorCode::UnsupportedGrantType,
+        OAuthErrorCode::UnsupportedResponseType,
+        OAuthErrorCode::InvalidScope,
+        OAuthErrorCode::AccessDenied,
+        OAuthErrorCode::LoginRequired,
+        OAuthErrorCode::ServerError,
+        OAuthErrorCode::TemporarilyUnavailable,
+        OAuthErrorCode::InvalidDpopProof,
+    ];
+
+    /// Exhaustive match: a new variant fails to compile here, forcing an
+    /// update of `ALL_CODES` and `FromStr`.
+    fn variant_index(c: OAuthErrorCode) -> usize {
+        match c {
+            OAuthErrorCode::InvalidRequest => 0,
+            OAuthErrorCode::InvalidClient => 1,
+            OAuthErrorCode::InvalidGrant => 2,
+            OAuthErrorCode::UnauthorizedClient => 3,
+            OAuthErrorCode::UnsupportedGrantType => 4,
+            OAuthErrorCode::UnsupportedResponseType => 5,
+            OAuthErrorCode::InvalidScope => 6,
+            OAuthErrorCode::AccessDenied => 7,
+            OAuthErrorCode::LoginRequired => 8,
+            OAuthErrorCode::ServerError => 9,
+            OAuthErrorCode::TemporarilyUnavailable => 10,
+            OAuthErrorCode::InvalidDpopProof => 11,
+        }
+    }
+
+    #[test]
+    fn from_str_round_trips_every_code() {
+        for (i, code) in ALL_CODES.iter().enumerate() {
+            assert_eq!(variant_index(*code), i);
+            assert_eq!(code.as_str().parse::<OAuthErrorCode>(), Ok(*code));
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_unknown_and_inexact() {
+        for s in [
+            "consent_required",
+            "",
+            "INVALID_REQUEST",
+            " invalid_request",
+        ] {
+            assert!(s.parse::<OAuthErrorCode>().is_err(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn from_str_error_does_not_echo_input() {
+        let hostile = "evil\u{1b}[31m<script>\n";
+        let err = hostile.parse::<OAuthErrorCode>().unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("evil") && !msg.contains("script"));
+        assert!(!format!("{err:?}").contains("evil"));
+    }
+
     fn rfc6749_ok(s: &str) -> bool {
         s.chars()
             .all(|c| matches!(c, '\u{20}' | '\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{7E}'))
@@ -308,8 +425,6 @@ mod tests {
         let shown = err.to_string();
         assert!(!shown.contains('\u{202E}') && !shown.contains('\n'));
     }
-
-    use super::*;
 
     fn location(response: &Response) -> &str {
         response

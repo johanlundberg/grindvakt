@@ -70,6 +70,8 @@ pub struct Provider {
     /// [`DEFAULT_CLIENT_ASSERTION_MAX_AGE`]; see
     /// [`Provider::with_client_assertion_max_age`].
     client_assertion_max_age: u64,
+    /// RFC 9207: emit `iss` in authorization responses. Opt-in.
+    emit_iss: bool,
 }
 
 /// Default maximum age of a `private_key_jwt` client assertion, in seconds.
@@ -298,6 +300,7 @@ impl Provider {
             token_use_store,
             caller_managed_pairwise_subjects: false,
             client_assertion_max_age: DEFAULT_CLIENT_ASSERTION_MAX_AGE,
+            emit_iss: false,
         })
     }
 
@@ -346,6 +349,45 @@ impl Provider {
     pub fn with_client_assertion_max_age(mut self, secs: u64) -> Self {
         self.client_assertion_max_age = secs;
         self
+    }
+
+    /// Opt in to RFC 9207: authorization responses (success and error
+    /// redirects, query or fragment) carry an `iss` parameter equal to the
+    /// issuer, and discovery advertises
+    /// `authorization_response_iss_parameter_supported: true`.
+    ///
+    /// Error redirects only carry `iss` when built with
+    /// [`Provider::authorization_error_redirect`]; `OAuthError::to_redirect`
+    /// does not add it, so use the Provider method once this is enabled.
+    pub fn with_authorization_response_iss(mut self) -> Self {
+        self.emit_iss = true;
+        self.metadata.extra.insert(
+            "authorization_response_iss_parameter_supported".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        self
+    }
+
+    /// Render an authorization error redirect for `req`, using its validated
+    /// response mode and adding `iss` when
+    /// [`Self::with_authorization_response_iss`] is enabled.
+    ///
+    /// `req` MUST come from `AuthorizationRequest::from_pairs` and its
+    /// `redirect_uri` MUST have passed the Provider's authorization request
+    /// validation: this method does not re-validate it, and a hand-built
+    /// request would make it an open redirect that also carries the trusted
+    /// `iss`.
+    pub fn authorization_error_redirect(
+        &self,
+        req: &AuthorizationRequest,
+        err: &OAuthError,
+    ) -> crate::http::Response {
+        let extra: &[(&str, &str)] = if self.emit_iss {
+            &[("iss", self.metadata.issuer.as_str())]
+        } else {
+            &[]
+        };
+        err.to_redirect_with_params(&req.redirect_uri, req.use_fragment(), extra)
     }
 
     /// The `.well-known/openid-configuration` document.
@@ -784,6 +826,9 @@ impl Provider {
 
         if let Some(state) = &req.state {
             out.push(("state".to_string(), state.clone()));
+        }
+        if self.emit_iss {
+            out.push(("iss".to_string(), self.metadata.issuer.clone()));
         }
 
         Ok(redirect_with(&req.redirect_uri, &out, req.use_fragment()))
