@@ -270,7 +270,7 @@ impl AuthorizationResponse {
     /// Requires a signed JWT (JWE is `BadRequest`), a non-empty algorithm
     /// list, the `typ` rule above, a `kid` naming a key when the set has
     /// several, `iss` equal to
-    /// `opts` issuer, `aud` exactly the client id (a multi-valued `aud` is
+    /// `opts` issuer, `aud` exactly the client id (a string or a one-element array; a multi-valued `aud` is
     /// rejected) and `exp`. The inner parameters must be strings and pass
     /// the same shape rules as a plain callback. Signature / claim failures
     /// are `Error::Authn`; shape failures `Error::BadRequest`.
@@ -330,13 +330,15 @@ impl AuthorizationResponse {
         ensure_kid_names_key(jwks, header.kid.as_deref(), "JARM response")?;
         let claims = jwt::verify_with_jwks(jwks, token, &validation)
             .map_err(|e| Error::Authn(format!("JARM response verification failed: {e}")))?;
-        match claims.aud.as_ref() {
-            Some(Audience::Single(a)) if a == opts.client_id => {}
-            _ => {
-                return Err(Error::Authn(
-                    "JARM aud must be exactly the client id".into(),
-                ))
-            }
+        let audience_is_client = match claims.aud.as_ref() {
+            Some(Audience::Single(a)) => a == opts.client_id,
+            Some(Audience::Multiple(values)) => values.len() == 1 && values[0] == opts.client_id,
+            None => false,
+        };
+        if !audience_is_client {
+            return Err(Error::Authn(
+                "JARM aud must be exactly the client id".into(),
+            ));
         }
         if claims.iss.as_deref() != Some(opts.issuer) {
             return Err(Error::Authn("JARM iss mismatch".into()));
@@ -1184,7 +1186,22 @@ mod tests {
             Some(TYP),
         )
         .unwrap();
-        authn(verify(&t, &k.to_public_jwks(), &ES));
+        // A singleton array is the client alone, as some OPs serialise `aud`.
+        assert!(verify(&t, &k.to_public_jwks(), &ES).is_ok());
+        // Repeating the client, or a singleton naming someone else, is refused.
+        for aud in [vec![CLIENT, CLIENT], vec!["other"], vec![]] {
+            let t = jwt::sign(
+                &k,
+                &jarm_claims(|c| {
+                    c.aud = Some(Audience::Multiple(
+                        aud.iter().map(|a| a.to_string()).collect(),
+                    ))
+                }),
+                Some(TYP),
+            )
+            .unwrap();
+            authn(verify(&t, &k.to_public_jwks(), &ES));
+        }
     }
 
     #[test]
