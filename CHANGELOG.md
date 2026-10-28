@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.1 [unreleased]
+## 0.9.1 [2026-10-28]
 
 - `display_safe`, `escape_upstream_text` and `is_invisible_format` are now
   public and re-exported from the crate root.
