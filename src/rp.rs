@@ -275,6 +275,40 @@ pub fn signed_request_object(
 /// hosts, for local development), and per OIDC Discovery §4.3 the `issuer`
 /// returned in the metadata MUST match the requested issuer exactly.
 pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<ProviderMetadata> {
+    discover_response(http, issuer).await.map(|r| r.metadata)
+}
+
+/// Provider metadata together with the HTTP response it came from.
+///
+/// Returned by [`discover_response`] so callers can cache the metadata using
+/// the response's `Cache-Control`/`Age` headers.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct DiscoveryResponse {
+    pub metadata: ProviderMetadata,
+    pub response: HttpFetchResponse,
+}
+
+impl DiscoveryResponse {
+    /// Remaining freshness in seconds, capped at `ceiling`; see
+    /// [`HttpFetchResponse::cache_ttl_secs_max`].
+    pub fn cache_ttl_secs_max(&self, ceiling: u64) -> Option<u64> {
+        self.response.cache_ttl_secs_max(ceiling)
+    }
+
+    /// Remaining freshness in seconds, capped at [`MAX_JWKS_CACHE_TTL_SECS`]
+    /// (24 h), so a hostile OP cannot pin discovery metadata for years.
+    pub fn cache_ttl_secs(&self) -> Option<u64> {
+        self.cache_ttl_secs_max(MAX_JWKS_CACHE_TTL_SECS)
+    }
+}
+
+/// Like [`discover`] but also returns the HTTP response (headers included) so
+/// the caller can cache the metadata. All checks are those of [`discover`].
+pub async fn discover_response(
+    http: &Arc<dyn HttpClient>,
+    issuer: &str,
+) -> Result<DiscoveryResponse> {
     let requested_issuer = issuer;
     validate_issuer(requested_issuer)?;
     let discovery_prefix = requested_issuer.trim_end_matches('/');
@@ -300,13 +334,16 @@ pub async fn discover(http: &Arc<dyn HttpClient>, issuer: &str) -> Result<Provid
         )));
     }
     ProviderInfo::from(metadata.clone()).validate()?;
-    Ok(metadata)
+    Ok(DiscoveryResponse {
+        metadata,
+        response: resp,
+    })
 }
 
 /// localhost / 127.0.0.1 / ::1 — the only hosts permitted over plain http.
 /// `Url::host_str` serializes IPv6 hosts in bracketed form (`[::1]`), so the
 /// brackets are stripped before parsing as an address.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
             .trim_start_matches('[')
@@ -550,31 +587,37 @@ impl JwksResponse {
     /// `None` when the header is absent or has no usable directive. Malformed
     /// input never panics.
     pub fn advertised_ttl_secs(&self) -> Option<u64> {
-        let header = self.cache_control.as_deref()?;
-        // An unterminated quote hides every later directive (a `no-store` after
-        // it would be swallowed): treat the field as unusable, fail closed.
-        if !quotes_balanced(header) {
+        advertised_ttl(self.cache_control.as_deref())
+    }
+}
+
+/// Freshness lifetime from a `Cache-Control` value; see
+/// [`JwksResponse::advertised_ttl_secs`] for the rules.
+pub(crate) fn advertised_ttl(cache_control: Option<&str>) -> Option<u64> {
+    let header = cache_control?;
+    // An unterminated quote hides every later directive (a `no-store` after
+    // it would be swallowed): treat the field as unusable, fail closed.
+    if !quotes_balanced(header) {
+        return Some(0);
+    }
+    let mut max_age = None;
+    for directive in split_unquoted_commas(header) {
+        let directive = directive.trim();
+        let (name, value) = match directive.split_once('=') {
+            Some((n, v)) => (n.trim(), Some(v.trim())),
+            None => (directive, None),
+        };
+        if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
             return Some(0);
         }
-        let mut max_age = None;
-        for directive in split_unquoted_commas(header) {
-            let directive = directive.trim();
-            let (name, value) = match directive.split_once('=') {
-                Some((n, v)) => (n.trim(), Some(v.trim())),
-                None => (directive, None),
-            };
-            if name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("no-cache") {
-                return Some(0);
-            }
-            if max_age.is_none() && name.eq_ignore_ascii_case("max-age") {
-                max_age = value
-                    .map(|v| v.trim_matches('"'))
-                    .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                    .map(|v| v.parse::<u64>().unwrap_or(u64::MAX));
-            }
+        if max_age.is_none() && name.eq_ignore_ascii_case("max-age") {
+            max_age = value
+                .map(|v| v.trim_matches('"'))
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .map(|v| v.parse::<u64>().unwrap_or(u64::MAX));
         }
-        max_age
     }
+    max_age
 }
 
 /// Like [`fetch_jwks`] but also returns `Cache-Control` and `ETag` so callers
@@ -606,13 +649,7 @@ pub async fn fetch_jwks_response(
         jwks,
         cache_control: resp.cache_control(),
         etag: resp.header("etag").map(str::to_string),
-        age: resp
-            .header("age")
-            .map(str::trim)
-            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-            // A digits-only value too large for u64 means "very old": saturate
-            // so no freshness remains, instead of reading it as no Age at all.
-            .map(|v| v.parse::<u64>().unwrap_or(u64::MAX)),
+        age: resp.age(),
     })
 }
 
@@ -1655,7 +1692,7 @@ pub fn claims_to_attributes(claims: &serde_json::Value) -> BTreeMap<String, Vec<
 /// JWK has a `kid` it still tries every key, so `kid = "nonexistent"` would
 /// verify against an unlabelled key. A token without `kid` passes here; callers
 /// decide whether that is allowed.
-fn ensure_kid_names_key(jwks: &JwkSet, kid: Option<&str>, what: &str) -> Result<()> {
+pub(crate) fn ensure_kid_names_key(jwks: &JwkSet, kid: Option<&str>, what: &str) -> Result<()> {
     match kid {
         Some(kid) if !jwks.keys.iter().any(|key| key.kid.as_deref() == Some(kid)) => Err(
             Error::Authn(format!("{what} kid does not name a key in the JWK Set")),
@@ -2235,6 +2272,109 @@ mod tests {
         let (_, provider, _) = client_and_provider();
         let err = provider.require_jwks_uri().unwrap_err();
         assert!(err.to_string().contains("jwks_uri"));
+    }
+
+    #[tokio::test]
+    async fn http_response_ttl_agrees_with_jwks_response() {
+        let cases = [
+            "no-store",
+            "no-cache",
+            "max-age=60, no-store",
+            "max-age=\"60\"",
+            "MAX-AGE=60",
+            "max-age=60, s-maxage=10",
+            "s-maxage=10",
+            "s-maxage=10, max-age=30",
+            "max-age=\"60",
+            "foo=\"x, no-store",
+            "max-age=abc",
+            "max-age=",
+            "max-age=99999999999999999999999",
+            "private",
+            "",
+        ];
+        for cc in cases {
+            let jwks = jwks_response_with(Some(cc)).await;
+            let resp =
+                crate::http::HttpFetchResponse::new(200, "").with_header("Cache-Control", cc);
+            assert_eq!(
+                resp.advertised_ttl_secs(),
+                jwks.advertised_ttl_secs(),
+                "{cc}"
+            );
+            assert_eq!(
+                resp.cache_ttl_secs_max(100),
+                jwks.cache_ttl_secs_max(100),
+                "{cc}"
+            );
+        }
+        let resp = crate::http::HttpFetchResponse::new(200, "");
+        assert_eq!(resp.advertised_ttl_secs(), None);
+        assert_eq!(resp.cache_ttl_secs_max(100), None);
+        // Age subtraction and ceiling.
+        let resp = crate::http::HttpFetchResponse::new(200, "")
+            .with_header("Cache-Control", "max-age=3600")
+            .with_header("Age", "3000");
+        assert_eq!(resp.cache_ttl_secs_max(10_000), Some(600));
+        assert_eq!(resp.cache_ttl_secs_max(100), Some(100));
+        let resp = resp.with_header("Age", "9999");
+        assert_eq!(resp.cache_ttl_secs_max(10_000), Some(600), "first Age wins");
+        let resp = crate::http::HttpFetchResponse::new(200, "")
+            .with_header("Cache-Control", "max-age=60")
+            .with_header("Age", "99999999999999999999999");
+        assert_eq!(resp.cache_ttl_secs_max(100), Some(0));
+    }
+
+    #[tokio::test]
+    async fn discover_response_returns_headers() {
+        let issuer = "https://op.example.com";
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(
+                metadata_response(issuer)
+                    .with_header("Cache-Control", "max-age=300")
+                    .with_header("Age", "100"),
+            ),
+            post: None,
+        });
+        let r = discover_response(&http, issuer).await.unwrap();
+        assert_eq!(r.metadata.issuer, issuer);
+        assert_eq!(r.response.header("cache-control"), Some("max-age=300"));
+        assert_eq!(r.cache_ttl_secs_max(3600), Some(200));
+        assert_eq!(r.cache_ttl_secs_max(50), Some(50));
+        assert_eq!(r.cache_ttl_secs(), Some(200));
+        let m = discover(&http, issuer).await.unwrap();
+        assert_eq!(m.issuer, r.metadata.issuer);
+    }
+
+    #[tokio::test]
+    async fn discover_response_default_ttl_is_capped() {
+        let issuer = "https://op.example.com";
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response(issuer).with_header("Cache-Control", "max-age=3153600000")),
+            post: None,
+        });
+        let r = discover_response(&http, issuer).await.unwrap();
+        assert_eq!(r.cache_ttl_secs(), Some(MAX_JWKS_CACHE_TTL_SECS));
+    }
+
+    #[tokio::test]
+    async fn discover_response_keeps_error_variants() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(metadata_response("https://evil.example.com")),
+            post: None,
+        });
+        let err = discover_response(&http, "https://op.example.com")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Authn(_)), "{err:?}");
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttp {
+            get: Some(crate::http::HttpFetchResponse::new(404, "nope")),
+            post: None,
+        });
+        let err = discover_response(&http, "https://op.example.com")
+            .await
+            .unwrap_err();
+        assert_eq!(err.upstream_http().unwrap().status, Some(404));
     }
 
     #[tokio::test]

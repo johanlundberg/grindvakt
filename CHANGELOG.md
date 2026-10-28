@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.1 [unreleased]
+
+- `display_safe`, `escape_upstream_text` and `is_invisible_format` are now
+  public and re-exported from the crate root.
+- New `jwt::JWS_ALGORITHMS` (also at the crate root) lists the JWS algorithms
+  the library knows, and `is_symmetric_jws_algorithm` identifies `HS*`.
+- `HttpFetchResponse` gains `age`, `advertised_ttl_secs` and
+  `cache_ttl_secs_max`, and `rp::discover_response` returns the discovery
+  metadata together with the response headers (`rp::DiscoveryResponse`) so
+  callers can honour `Cache-Control` and `Age`. `rp::discover` is unchanged.
+- `Error::is_retryable` and `UpstreamHttpError::is_retryable` report whether
+  the upstream status (5xx or 429) suggests retrying.
+- `OAuthErrorCode` implements `FromStr` (unknown codes return
+  `ParseOAuthErrorCodeError`).
+- New `callback` module: `parse_authorization_response` (and `_str`, `_multi`,
+  `_request` variants) parse and validate authorization callbacks, including
+  JARM, with `AuthorizationResponse::verify_jarm` for signed JARM responses.
+  `JARM_ASYMMETRIC_ALGORITHMS` is the recommended allow-list for it (no
+  `HS*`). JARM responses must carry JOSE `typ` `oauth-authz-resp+jwt` (or
+  `application/oauth-authz-resp+jwt`) by default (`JarmOptions::with_expected_typ`); a missing `typ` needs the
+  opt-in `with_dedicated_keys` / `allow_untyped_shared_keys`.
+- New opt-in `Provider::with_authorization_response_iss` adds the `iss`
+  parameter (RFC 9207) to authorization responses, advertises
+  `authorization_response_iss_parameter_supported`, and
+  `Provider::authorization_error_redirect` builds error redirects that carry
+  `iss`. With it enabled, a query-mode `redirect_uri` that already has an
+  `iss` parameter is refused (`server_error`) instead of producing a duplicate. Without it the Provider behaves as before.
+
 ## 0.9.0 [2026-10-09]
 
 - `rp::validate_issuer`, `rp::validate_service_endpoint_for_issuer` and

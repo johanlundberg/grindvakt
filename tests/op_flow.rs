@@ -15,6 +15,7 @@ use grindvakt::pkce;
 use grindvakt::provider::{InMemoryTokenUseStore, Provider, TokenLifetimes, CLIENT_ASSERTION_TYPE};
 use grindvakt::request::AuthorizationRequest;
 use grindvakt::tokens::TokenCodec;
+use grindvakt::{OAuthError, OAuthErrorCode};
 
 struct AcceptDpopProof;
 
@@ -2800,4 +2801,243 @@ async fn hostile_state_is_refused_before_any_response() {
             .await
             .is_err());
     }
+}
+
+// ── RFC 9207 authorization response `iss` (opt-in) ──────────────────────
+
+fn iss_client() -> Client {
+    Client {
+        client_id: "rp-iss".into(),
+        client_secret: Some("s".into()),
+        redirect_uris: vec!["https://rp.example.com/cb".into()],
+        response_types: vec!["code".into(), "code id_token".into()],
+        grant_types: vec!["authorization_code".into()],
+        token_endpoint_auth_method: AUTH_CLIENT_SECRET_POST.into(),
+        jwks: None,
+        scope: Some("openid".into()),
+        subject_type: "public".into(),
+        client_name: None,
+    }
+}
+
+fn iss_request(response_type: &str) -> AuthorizationRequest {
+    AuthorizationRequest::from_pairs(&pairs(&[
+        ("client_id", "rp-iss"),
+        ("response_type", response_type),
+        ("redirect_uri", "https://rp.example.com/cb"),
+        ("scope", "openid"),
+        ("nonce", "n-1"),
+        ("state", "x&iss=evil"),
+    ]))
+    .unwrap()
+}
+
+fn location_of(r: &grindvakt::http::Response) -> String {
+    r.headers
+        .iter()
+        .find(|(k, _)| k == "location")
+        .unwrap()
+        .1
+        .clone()
+}
+
+fn all_params(location: &str) -> Vec<(String, String)> {
+    let (_, rest) = location.split_once(['?', '#']).unwrap();
+    rest.split('&')
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                percent_encoding::percent_decode_str(v)
+                    .decode_utf8_lossy()
+                    .replace('+', " "),
+            )
+        })
+        .collect()
+}
+
+fn assert_single_iss(location: &str) {
+    let iss: Vec<_> = all_params(location)
+        .into_iter()
+        .filter(|(k, _)| k == "iss")
+        .collect();
+    assert_eq!(iss.len(), 1, "{location}");
+    assert_eq!(iss[0].1, "https://op.example.com");
+}
+
+fn iss_op(opt_in: bool) -> Provider {
+    let op = provider_with(InMemoryClientStore::with_clients(vec![iss_client()]));
+    if opt_in {
+        op.with_authorization_response_iss()
+    } else {
+        op
+    }
+}
+
+#[tokio::test]
+async fn authorization_response_iss_in_query_and_fragment_when_opted_in() {
+    let op = iss_op(true);
+    let code = op
+        .authorization_redirect(&iss_request("code"), "sub", &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    let loc = location_of(&code);
+    assert!(loc.starts_with("https://rp.example.com/cb?"), "{loc}");
+    assert_single_iss(&loc);
+    assert_eq!(extract_param(&loc, "state").as_deref(), Some("x&iss=evil"));
+
+    let hybrid = op
+        .authorization_redirect(&iss_request("code id_token"), "sub", &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    let loc = location_of(&hybrid);
+    assert!(loc.contains('#'), "{loc}");
+    assert_single_iss(&loc);
+    assert_eq!(extract_param(&loc, "state").as_deref(), Some("x&iss=evil"));
+
+    assert_eq!(
+        op.discovery_document()["authorization_response_iss_parameter_supported"],
+        serde_json::Value::Bool(true)
+    );
+}
+
+#[tokio::test]
+async fn authorization_error_redirect_carries_iss_when_opted_in() {
+    let op = iss_op(true);
+    let err =
+        OAuthError::bare(OAuthErrorCode::AccessDenied).with_state(Some("x&iss=evil".to_string()));
+    for (rt, frag) in [("code", false), ("code id_token", true)] {
+        let loc = location_of(
+            &op.authorization_error_redirect(&iss_request(rt), &err)
+                .unwrap(),
+        );
+        assert_eq!(loc.contains('#'), frag, "{loc}");
+        assert_single_iss(&loc);
+        assert!(loc.contains("error=access_denied"), "{loc}");
+    }
+}
+
+#[tokio::test]
+async fn authorization_response_has_no_iss_without_opt_in() {
+    let op = iss_op(false);
+    let ok = op
+        .authorization_redirect(&iss_request("code"), "sub", &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    let loc = location_of(&ok);
+    let iss: Vec<_> = all_params(&loc)
+        .into_iter()
+        .filter(|(k, _)| k == "iss")
+        .collect();
+    assert!(iss.is_empty(), "{loc}");
+
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    let loc = location_of(
+        &op.authorization_error_redirect(&iss_request("code"), &err)
+            .unwrap(),
+    );
+    assert!(!loc.contains("iss="), "{loc}");
+    assert_eq!(
+        loc,
+        location_of(&err.to_redirect("https://rp.example.com/cb", false))
+    );
+    assert!(op
+        .discovery_document()
+        .get("authorization_response_iss_parameter_supported")
+        .is_none());
+}
+
+fn iss_collision_op(opt_in: bool) -> Provider {
+    let mut c = iss_client();
+    c.redirect_uris = ["?iss=old", "?%69ss=old", "?a=b", "?x=1&iss=old"]
+        .iter()
+        .map(|q| format!("https://rp.example.com/cb{q}"))
+        .collect();
+    let op = provider_with(InMemoryClientStore::with_clients(vec![c]));
+    if opt_in {
+        op.with_authorization_response_iss()
+    } else {
+        op
+    }
+}
+
+fn iss_collision_request(
+    response_type: &str,
+    query: &str,
+    mode: Option<&str>,
+) -> AuthorizationRequest {
+    let uri = format!("https://rp.example.com/cb{query}");
+    let mut p = vec![
+        ("client_id", "rp-iss"),
+        ("response_type", response_type),
+        ("redirect_uri", uri.as_str()),
+        ("scope", "openid"),
+        ("nonce", "n-1"),
+    ];
+    if let Some(m) = mode {
+        p.push(("response_mode", m));
+    }
+    AuthorizationRequest::from_pairs(&pairs(&p)).unwrap()
+}
+
+#[tokio::test]
+async fn iss_collision_rejected_when_opted_in() {
+    let op = iss_collision_op(true);
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    for q in ["?iss=old", "?%69ss=old"] {
+        let req = iss_collision_request("code", q, None);
+        let e = op
+            .authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, OAuthErrorCode::ServerError, "{q}");
+        assert!(!e.to_string().contains("old"), "{q}");
+        let e = op.authorization_error_redirect(&req, &err).unwrap_err();
+        assert_eq!(e.code, OAuthErrorCode::ServerError, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn iss_collision_allows_other_params_and_fragment_mode() {
+    let op = iss_collision_op(true);
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    let req = iss_collision_request("code", "?a=b", None);
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert_single_iss(&loc);
+    assert_eq!(extract_param(&loc, "a").as_deref(), Some("b"));
+    assert_single_iss(&location_of(
+        &op.authorization_error_redirect(&req, &err).unwrap(),
+    ));
+
+    let req = iss_collision_request("code", "?iss=old", Some("fragment"));
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert!(loc.contains("#"), "{loc}");
+    assert!(loc.contains("?iss=old#"), "{loc}");
+    assert!(op.authorization_error_redirect(&req, &err).is_ok());
+}
+
+#[tokio::test]
+async fn iss_collision_ignored_without_opt_in() {
+    let op = iss_collision_op(false);
+    let req = iss_collision_request("code", "?iss=old", None);
+    let loc = location_of(
+        &op.authorization_redirect(&req, "sub", &BTreeMap::new(), None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        loc.starts_with("https://rp.example.com/cb?iss=old&"),
+        "{loc}"
+    );
+    let err = OAuthError::bare(OAuthErrorCode::AccessDenied);
+    let loc = location_of(&op.authorization_error_redirect(&req, &err).unwrap());
+    assert!(loc.contains("iss=old"), "{loc}");
 }
